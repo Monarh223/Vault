@@ -3,6 +3,7 @@ import html
 import io
 import json
 import logging
+import os
 import re
 import sqlite3
 import shutil
@@ -30,8 +31,28 @@ from aiohttp import web
 # =========================================================
 # CONFIG - ALL IN ONE FILE
 # =========================================================
-BOT_TOKEN = "8774926411:AAGfVWKNiClL1M0nU3W4L-RoJWod3UJMZPI"
-DB_PATH = "bot.db"
+def load_local_env(env_path: str = ".env"):
+  try:
+    env_file = Path(env_path)
+    if not env_file.exists():
+      return
+    for raw_line in env_file.read_text(encoding="utf-8").splitlines():
+      line = raw_line.strip()
+      if not line or line.startswith("#") or "=" not in line:
+        continue
+      key, value = line.split("=", 1)
+      key = key.strip()
+      value = value.strip().strip('"').strip("'")
+      if key and key not in os.environ:
+        os.environ[key] = value
+  except Exception:
+    logging.exception("Failed to load .env file")
+
+load_local_env()
+BOT_TOKEN = (os.getenv("BOT_TOKEN") or "").strip()
+if not BOT_TOKEN:
+  raise RuntimeError("BOT_TOKEN is missing. Put it into the .env file or environment variables.")
+DB_PATH = (os.getenv("DB_PATH") or "/data/bot.db").strip()
 BOT_USERNAME_FALLBACK = "DiamondVaultV_bot"
 
 # Roles
@@ -51,7 +72,7 @@ CRYPTO_PAY_BASE_URL = "https://pay.crypt.bot/api"
 CRYPTO_PAY_ASSET = "USDT"
 CRYPTO_PAY_PIN_CHECK_TO_USER = False # True -> check pinned to telegram user
 
-OPERATORS = {
+BASE_OPERATORS = {
   "mts": {"title": "МТС", "price": 4.00, "command": "/mts"},
   "mts_premium": {"title": "МТС Салон", "price": 4.00, "command": "/mtspremium"},
   "bil": {"title": "Билайн", "price": 4.50, "command": "/bil"},
@@ -60,6 +81,8 @@ OPERATORS = {
   "vtb": {"title": "ВТБ", "price": 4.80, "command": "/vtb"},
   "gaz": {"title": "Газпром", "price": 4.90, "command": "/gaz"},
 }
+
+OPERATORS = {k: dict(v) for k, v in BASE_OPERATORS.items()}
 # =========================================================
 
 START_BANNER = "start_banner.jpg"
@@ -68,8 +91,8 @@ MY_NUMBERS_BANNER = "my_numbers_banner.jpg"
 WITHDRAW_BANNER = "withdraw_banner.jpg"
 MSK_OFFSET = timedelta(hours=3)
 WEBAPP_HOST = "0.0.0.0"
-WEBAPP_PORT = int(__import__("os").getenv("PORT", "8080"))
-WEBAPP_BASE_URL = (__import__("os").getenv("WEBAPP_BASE_URL") or "https://vault-production-67a7.up.railway.app").rstrip("/")
+WEBAPP_PORT = int(os.getenv("PORT", "8080"))
+WEBAPP_BASE_URL = (os.getenv("WEBAPP_BASE_URL") or "https://vault-production-67a7.up.railway.app").rstrip("/")
 MINI_PROFILE_BANNER = "mini_profile_banner.jpg"
 MINI_MANUALS_BANNER = "mini_manuals_banner.jpg"
 
@@ -256,6 +279,10 @@ class Database:
       ensure_extra_schema()
     except Exception:
       pass
+    try:
+      reload_operators_from_db()
+    except Exception:
+      logging.exception("reload_operators_from_db failed after db replace")
     return backup_path
 
   def import_users_from_uploaded_db(self, uploaded_path: str):
@@ -1684,11 +1711,18 @@ def user_admin_kb():
 
 def queue_manage_kb():
   kb = InlineKeyboardBuilder()
-  for item in latest_queue_items(10):
-    kb.button(text=f"🗑 #{item['id']} {op_text(item['operator_key'])} {mode_label(item['mode'])}", callback_data=f"admin:queue_remove:{item['id']}")
+  items = latest_queue_items(10)
+  for item in items:
+    label = f"#{item['id']} {op_text(item['operator_key'])} {mode_label(item['mode'])}"
+    kb.button(text=f"👁 {label}"[:64], callback_data=f"admin:queue_view:{item['id']}")
+    kb.button(text=f"🗑 {label}"[:64], callback_data=f"admin:queue_remove:{item['id']}")
   kb.button(text="🔄 Обновить список", callback_data="admin:queues")
+  kb.button(text="🖼 Общий просмотр QR", callback_data="admin:qr_numbers")
   kb.button(text="↩️ Назад", callback_data="admin:home")
-  kb.adjust(1)
+  if items:
+    kb.adjust(*([2] * len(items)), 1, 1, 1)
+  else:
+    kb.adjust(1, 1, 1)
   return kb.as_markup()
 
 
@@ -3307,6 +3341,13 @@ def load_extra_operators_from_settings():
     db.set_setting(f'allow_no_hold_{key}', db.get_setting(f'allow_no_hold_{key}', '1'))
 
 
+def reload_operators_from_db():
+  global OPERATORS
+  OPERATORS.clear()
+  OPERATORS.update({k: dict(v) for k, v in BASE_OPERATORS.items()})
+  load_extra_operators_from_settings()
+
+
 def load_extra_operator_items():
   raw = db.get_setting('extra_operators_json', '[]') or '[]'
   try:
@@ -3320,7 +3361,7 @@ def save_extra_operator_items(items):
   db.set_setting('extra_operators_json', json.dumps(items, ensure_ascii=False))
 
 
-load_extra_operators_from_settings()
+reload_operators_from_db()
 
 
 def is_priority_queue_user(user_id: int, username: str | None = None) -> bool:
@@ -7537,6 +7578,25 @@ def render_admin_queue_text() -> str:
     rows.append(f"#{item['id']} • {op_text(item['operator_key'])} • {mode_label(item['mode'])} • {pretty_phone(item['normalized_phone'])}{pos_text}")
   return "<b>📦 Очередь</b>\n\n" + quote_block(rows)
 
+async def send_admin_queue_preview(target_message: Message, item_id: int):
+  item = db.get_queue_item(int(item_id))
+  if not item:
+    await target_message.answer("<b>👁 Просмотр заявки</b>\n\n<i>Заявка не найдена.</i>", reply_markup=queue_manage_kb())
+    return
+  caption = (
+    f"<b>👁 Просмотр заявки без взятия</b>\n\n"
+    f"<b>📌 ID:</b> <code>#{item['id']}</code>\n"
+    f"<b>📱 Оператор:</b> {escape(op_text(item['operator_key']))}\n"
+    f"<b>🧾 Режим:</b> {escape(mode_label(item['mode']))}\n"
+    f"<b>☎️ Номер:</b> <code>{pretty_phone(item['normalized_phone'])}</code>\n"
+    f"<b>📍 Статус:</b> {escape(item['status'])}\n"
+    f"<b>🕒 Создано:</b> {escape(item['created_at'])}"
+  )
+  try:
+    await target_message.answer_photo(queue_photo_input(item['qr_file_id']), caption=caption, reply_markup=admin_back_kb('admin:queues'))
+  except Exception:
+    await target_message.answer(caption + "\n\n<i>QR preview недоступен.</i>", reply_markup=admin_back_kb('admin:queues'))
+
 @router.callback_query(F.data == "admin:qr_numbers")
 async def admin_qr_numbers(callback: CallbackQuery):
   if not is_admin(callback.from_user.id):
@@ -7564,6 +7624,30 @@ async def admin_queues(callback: CallbackQuery):
   if not is_admin(callback.from_user.id):
     return
   await safe_edit_or_send(callback, render_admin_queue_text(), reply_markup=queue_manage_kb())
+  await callback.answer()
+
+@router.callback_query(F.data.startswith("admin:queue_view:"))
+async def admin_queue_view(callback: CallbackQuery):
+  if not is_admin(callback.from_user.id):
+    return
+  try:
+    item_id = int(callback.data.rsplit(":", 1)[1])
+  except Exception:
+    await callback.answer("Некорректный ID", show_alert=True)
+    return
+  await send_admin_queue_preview(callback.message, item_id)
+  await callback.answer()
+
+@router.callback_query(F.data.startswith("admin:queue_view:"))
+async def admin_queue_view(callback: CallbackQuery):
+  if not is_admin(callback.from_user.id):
+    return
+  try:
+    item_id = int(callback.data.rsplit(":", 1)[1])
+  except Exception:
+    await callback.answer("Некорректный ID", show_alert=True)
+    return
+  await send_admin_queue_preview(callback.message, item_id)
   await callback.answer()
 
 @router.callback_query(F.data == "admin:user_tools")
@@ -8282,6 +8366,14 @@ async def db_upload_receive(message: Message, state: FSMContext, bot: Bot):
       temp_path.unlink(missing_ok=True)
     else:
       backup_path = db.replace_with_uploaded_db(str(temp_path))
+      try:
+        db.reconnect()
+      except Exception:
+        logging.exception("db reconnect failed after upload")
+      try:
+        reload_operators_from_db()
+      except Exception:
+        logging.exception("reload_operators_from_db failed after upload")
   except Exception as e:
     logging.exception("db_upload_receive failed")
     temp_path.unlink(missing_ok=True)
