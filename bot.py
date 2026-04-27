@@ -196,6 +196,7 @@ class AdminStates(StatesGroup):
   waiting_summary_date = State()
   waiting_miniapp_text = State()
   waiting_miniapp_submit_bot = State()
+  waiting_page_jump = State()
 
 
 @dataclass
@@ -1719,20 +1720,52 @@ def user_admin_kb():
   return kb.as_markup()
 
 
-def queue_manage_kb():
+def admin_operator_filter_buttons(kb: InlineKeyboardBuilder, prefix: str, current_operator: str = "all", page: int = 0):
+  buttons = [("Все", "all")] + [(OPERATORS[key]['title'], key) for key in OPERATORS.keys()]
+  for title, key in buttons:
+    marker = "✅ " if key == current_operator else ""
+    kb.button(text=(marker + title)[:32], callback_data=f"{prefix}:{key}:{page}")
+
+
+def queue_page_items(page: int = 0, per_page: int = 10, operator_key: str = "all"):
+  page = max(0, int(page))
+  params = []
+  where = "WHERE status='queued'"
+  if operator_key != "all":
+    where += " AND operator_key=?"
+    params.append(operator_key)
+  total = db.conn.execute(f"SELECT COUNT(*) AS c FROM queue_items {where}", tuple(params)).fetchone()['c'] or 0
+  offset = page * per_page
+  rows = db.conn.execute(
+    f"SELECT * FROM queue_items {where} ORDER BY id DESC LIMIT ? OFFSET ?",
+    tuple(params + [per_page, offset])
+  ).fetchall()
+  return rows, int(total)
+
+
+def queue_manage_kb(page: int = 0, operator_key: str = "all"):
   kb = InlineKeyboardBuilder()
-  items = latest_queue_items(10)
+  items, total = queue_page_items(page, 10, operator_key)
+  admin_operator_filter_buttons(kb, "admin:queue_filter", operator_key, page)
   for item in items:
     label = f"#{item['id']} {op_text(item['operator_key'])} {mode_label(item['mode'])}"
-    kb.button(text=f"👁 {label}"[:64], callback_data=f"admin:queue_view:{item['id']}")
-    kb.button(text=f"🗑 {label}"[:64], callback_data=f"admin:queue_remove:{item['id']}")
-  kb.button(text="🔄 Обновить список", callback_data="admin:queues")
-  kb.button(text="🖼 Общий просмотр QR", callback_data="admin:qr_numbers")
+    kb.button(text=f"👁 {label}"[:64], callback_data=f"admin:queue_view:{item['id']}:{page}:{operator_key}")
+    kb.button(text=f"🗑 {label}"[:64], callback_data=f"admin:queue_remove:{item['id']}:{page}:{operator_key}")
+  total_pages = max(1, (int(total) + 9) // 10)
+  safe_page = min(max(0, int(page)), total_pages - 1)
+  prev_page = safe_page - 1 if safe_page > 0 else total_pages - 1
+  next_page = safe_page + 1 if safe_page < total_pages - 1 else 0
+  kb.button(text="⬅️", callback_data=f"admin:queues:{prev_page}:{operator_key}")
+  kb.button(text=f"{safe_page + 1}/{total_pages}", callback_data="admin:queues:noop")
+  kb.button(text="➡️", callback_data=f"admin:queues:{next_page}:{operator_key}")
+  kb.button(text="🔄 Обновить список", callback_data=f"admin:queues:{safe_page}:{operator_key}")
+  kb.button(text="🔢 Ввести страницу", callback_data=f"admin:queue_jump:{safe_page}:{operator_key}")
+  kb.button(text="🖼 Общий просмотр QR", callback_data=f"admin:qr_numbers:0:{operator_key}")
   kb.button(text="↩️ Назад", callback_data="admin:home")
   if items:
-    kb.adjust(*([2] * len(items)), 1, 1, 1)
+    kb.adjust(3, *([2] * len(items)), 3, 1, 1, 1, 1)
   else:
-    kb.adjust(1, 1, 1)
+    kb.adjust(3, 3, 1, 1, 1, 1)
   return kb.as_markup()
 
 
@@ -7508,20 +7541,46 @@ async def hold_watcher(bot: Bot):
     await asyncio.sleep(5)
 
 
-def recent_qr_items(limit: int = 50):
-  return db.conn.execute("SELECT * FROM queue_items ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+def recent_qr_items(limit: int = 50, operator_key: str = "all"):
+  params = []
+  where = ""
+  if operator_key != "all":
+    where = "WHERE operator_key=?"
+    params.append(operator_key)
+  return db.conn.execute(f"SELECT * FROM queue_items {where} ORDER BY id DESC LIMIT ?", tuple(params + [limit])).fetchall()
 
-def admin_qr_browser_kb(index: int, total: int):
+
+def qr_page_items(page: int = 0, per_page: int = 1, operator_key: str = "all"):
+  page = max(0, int(page))
+  params = []
+  where = ""
+  if operator_key != "all":
+    where = "WHERE operator_key=?"
+    params.append(operator_key)
+  total = db.conn.execute(f"SELECT COUNT(*) AS c FROM queue_items {where}", tuple(params)).fetchone()['c'] or 0
+  offset = page * per_page
+  rows = db.conn.execute(
+    f"SELECT * FROM queue_items {where} ORDER BY id DESC LIMIT ? OFFSET ?",
+    tuple(params + [per_page, offset])
+  ).fetchall()
+  return rows, int(total)
+
+
+def admin_qr_browser_kb(index: int, total: int, operator_key: str = "all"):
   kb = InlineKeyboardBuilder()
+  admin_operator_filter_buttons(kb, "admin:qr_filter", operator_key, index)
   prev_i = index - 1 if index > 0 else total - 1
   next_i = index + 1 if index < total - 1 else 0
-  kb.button(text="⬅️", callback_data=f"admin:qr_numbers:{prev_i}")
+  kb.button(text="⬅️", callback_data=f"admin:qr_numbers:{prev_i}:{operator_key}")
   kb.button(text=f"{index + 1}/{total}", callback_data="admin:qr_numbers:noop")
-  kb.button(text="➡️", callback_data=f"admin:qr_numbers:{next_i}")
-  kb.button(text="🔄 Обновить", callback_data=f"admin:qr_numbers:{index}")
+  kb.button(text="➡️", callback_data=f"admin:qr_numbers:{next_i}:{operator_key}")
+  kb.button(text="🔄 Обновить", callback_data=f"admin:qr_numbers:{index}:{operator_key}")
+  kb.button(text="🔢 Ввести страницу", callback_data=f"admin:qr_jump:{index}:{operator_key}")
+  kb.button(text="📦 К очереди", callback_data=f"admin:queues:0:{operator_key}")
   kb.button(text="↩️ Назад", callback_data="admin:home")
-  kb.adjust(3,2)
+  kb.adjust(3,3,1,1,1)
   return kb.as_markup()
+
 
 def render_qr_browser_caption(item) -> str:
   username = item['username'] or 'без username'
@@ -7533,7 +7592,11 @@ def render_qr_browser_caption(item) -> str:
   mode = mode_label(item['mode'])
   status = item['status']
   created = item['created_at']
-  user_line = f"<b>👤 Человек:</b> {escape(name)}\n<b>🆔 ID:</b> <code>{item['user_id']}</code>\n<b>🔗 Username:</b> {escape(username)}"
+  user_line = (
+    f"<b>👤 Человек:</b> {escape(name)}\n"
+    f"<b>🆔 ID:</b> <code>{item['user_id']}</code>\n"
+    f"<b>🔗 Username:</b> {escape(username)}"
+  )
   return (
     f"<b>🖼 QR и номера</b>\n\n"
     f"<b>📌 Заявка:</b> <code>#{item['id']}</code>\n"
@@ -7545,53 +7608,62 @@ def render_qr_browser_caption(item) -> str:
     + user_line
   )
 
-async def open_qr_browser_message(message: Message, index: int = 0):
-  items = recent_qr_items(50)
-  if not items:
+async def open_qr_browser_message(message: Message, index: int = 0, operator_key: str = "all"):
+  rows, total = qr_page_items(index, 1, operator_key)
+  if not rows:
     await message.answer("<b>🖼 QR и номера</b>\n\n<i>Заявок пока нет.</i>", reply_markup=admin_back_kb())
     return
-  idx = max(0, min(index, len(items) - 1))
-  item = items[idx]
+  idx = max(0, min(index, total - 1))
+  item = rows[0]
   caption = render_qr_browser_caption(item)
-  photo = queue_photo_input(item['qr_file_id'])
   try:
-    await message.answer_photo(photo, caption=caption, reply_markup=admin_qr_browser_kb(idx, len(items)))
+    await send_queue_item_photo_to_chat(message.bot, message.chat.id, item, caption=caption, reply_markup=admin_qr_browser_kb(idx, total, operator_key), message_thread_id=getattr(message, 'message_thread_id', None))
   except Exception:
-    await message.answer(caption + "\n\n<i>QR preview недоступен.</i>", reply_markup=admin_qr_browser_kb(idx, len(items)))
+    logging.exception('admin qr browser photo preview failed')
+    await message.answer(caption + "\n\n<i>QR preview недоступен.</i>", reply_markup=admin_qr_browser_kb(idx, total, operator_key))
 
-async def update_qr_browser_message(callback: CallbackQuery, index: int = 0):
-  items = recent_qr_items(50)
-  if not items:
+async def update_qr_browser_message(callback: CallbackQuery, index: int = 0, operator_key: str = "all"):
+  rows, total = qr_page_items(index, 1, operator_key)
+  if not rows:
     await safe_edit_or_send(callback, "<b>🖼 QR и номера</b>\n\n<i>Заявок пока нет.</i>", reply_markup=admin_back_kb())
     return
-  idx = max(0, min(index, len(items) - 1))
-  item = items[idx]
+  idx = max(0, min(index, total - 1))
+  item = rows[0]
   caption = render_qr_browser_caption(item)
-  photo = queue_photo_input(item['qr_file_id'])
   try:
-    media = InputMediaPhoto(media=photo, caption=caption, parse_mode=ParseMode.HTML)
-    await callback.message.edit_media(media=media, reply_markup=admin_qr_browser_kb(idx, len(items)))
+    if callback.message:
+      try:
+        await callback.message.delete()
+      except Exception:
+        pass
+    await send_queue_item_photo_to_chat(callback.bot, callback.message.chat.id, item, caption=caption, reply_markup=admin_qr_browser_kb(idx, total, operator_key), message_thread_id=getattr(callback.message, 'message_thread_id', None))
   except Exception:
-    try:
-      await callback.message.edit_caption(caption=caption + "\n\n<i>QR preview недоступен.</i>", reply_markup=admin_qr_browser_kb(idx, len(items)), parse_mode=ParseMode.HTML)
-    except Exception:
-      await callback.message.answer(caption + "\n\n<i>QR preview недоступен.</i>", reply_markup=admin_qr_browser_kb(idx, len(items)))
+    logging.exception('admin qr browser nav photo preview failed')
+    await callback.message.answer(caption + "\n\n<i>QR preview недоступен.</i>", reply_markup=admin_qr_browser_kb(idx, total, operator_key))
 
-def render_admin_queue_text() -> str:
-  items = latest_queue_items(10)
+def render_admin_queue_text(page: int = 0, operator_key: str = "all") -> str:
+  items, total = queue_page_items(page, 10, operator_key)
+  total_pages = max(1, (int(total) + 9) // 10)
+  safe_page = min(max(0, int(page)), total_pages - 1)
   if not items:
-    return "<b>📦 Очередь</b>\n\n<i>Активных заявок в очереди нет.</i>"
+    title = "<b>📦 Очередь</b>"
+    if operator_key != 'all':
+      title += f"\n<b>Фильтр:</b> {escape(op_text(operator_key))}"
+    return title + "\n\n<i>Активных заявок в очереди нет.</i>"
   rows = []
   for item in items:
     pos = queue_position(item['id']) if item['status'] == 'queued' else None
     pos_text = f" • позиция {pos}" if pos else ""
     rows.append(f"#{item['id']} • {op_text(item['operator_key'])} • {mode_label(item['mode'])} • {pretty_phone(item['normalized_phone'])}{pos_text}")
-  return "<b>📦 Очередь</b>\n\n" + quote_block(rows)
+  header = f"<b>📦 Очередь</b>\n<b>Страница:</b> {safe_page + 1}/{total_pages}"
+  if operator_key != 'all':
+    header += f"\n<b>Фильтр:</b> {escape(op_text(operator_key))}"
+  return header + "\n\n" + quote_block(rows)
 
-async def send_admin_queue_preview(target_message: Message, item_id: int):
+async def send_admin_queue_preview(target_message: Message, item_id: int, back_page: int = 0, back_operator: str = "all"):
   item = db.get_queue_item(int(item_id))
   if not item:
-    await target_message.answer("<b>👁 Просмотр заявки</b>\n\n<i>Заявка не найдена.</i>", reply_markup=queue_manage_kb())
+    await target_message.answer("<b>👁 Просмотр заявки</b>\n\n<i>Заявка не найдена.</i>", reply_markup=queue_manage_kb(back_page, back_operator))
     return
   caption = (
     f"<b>👁 Просмотр заявки без взятия</b>\n\n"
@@ -7603,61 +7675,172 @@ async def send_admin_queue_preview(target_message: Message, item_id: int):
     f"<b>🕒 Создано:</b> {escape(item['created_at'])}"
   )
   try:
-    await target_message.answer_photo(queue_photo_input(item['qr_file_id']), caption=caption, reply_markup=admin_back_kb('admin:queues'))
+    await send_queue_item_photo_to_chat(target_message.bot, target_message.chat.id, item, caption=caption, reply_markup=queue_manage_kb(back_page, back_operator), message_thread_id=getattr(target_message, 'message_thread_id', None))
   except Exception:
-    await target_message.answer(caption + "\n\n<i>QR preview недоступен.</i>", reply_markup=admin_back_kb('admin:queues'))
+    logging.exception('admin queue preview photo failed')
+    await target_message.answer(caption + "\n\n<i>QR preview недоступен.</i>", reply_markup=queue_manage_kb(back_page, back_operator))
 
 @router.callback_query(F.data == "admin:qr_numbers")
 async def admin_qr_numbers(callback: CallbackQuery):
   if not is_admin(callback.from_user.id):
     return
-  await open_qr_browser_message(callback.message, 0)
+  await open_qr_browser_message(callback.message, 0, "all")
+  await callback.answer()
+
+@router.callback_query(F.data.startswith("admin:qr_filter:"))
+async def admin_qr_filter(callback: CallbackQuery):
+  if not is_admin(callback.from_user.id):
+    return
+  parts = callback.data.split(":")
+  operator_key = parts[2] if len(parts) > 2 else "all"
+  try:
+    idx = int(parts[3]) if len(parts) > 3 else 0
+  except Exception:
+    idx = 0
+  await update_qr_browser_message(callback, idx, operator_key)
   await callback.answer()
 
 @router.callback_query(F.data.startswith("admin:qr_numbers:"))
 async def admin_qr_numbers_nav(callback: CallbackQuery):
   if not is_admin(callback.from_user.id):
     return
-  tail = callback.data.split(":", 2)[2]
-  if tail == "noop":
+  tail = callback.data.split(":")
+  if len(tail) >= 3 and tail[2] == "noop":
     await callback.answer()
     return
   try:
-    idx = int(tail)
+    idx = int(tail[2]) if len(tail) > 2 else 0
   except Exception:
     idx = 0
-  await update_qr_browser_message(callback, idx)
+  operator_key = tail[3] if len(tail) > 3 else "all"
+  await update_qr_browser_message(callback, idx, operator_key)
   await callback.answer()
+
+
+@router.callback_query(F.data.startswith("admin:queue_jump:"))
+async def admin_queue_jump_prompt(callback: CallbackQuery, state: FSMContext):
+  if not is_admin(callback.from_user.id):
+    return
+  parts = callback.data.split(":")
+  try:
+    current_page = int(parts[2]) if len(parts) > 2 else 0
+  except Exception:
+    current_page = 0
+  operator_key = parts[3] if len(parts) > 3 else "all"
+  items, total = queue_page_items(0, 10, operator_key)
+  total_pages = max(1, (int(total) + 9) // 10)
+  await state.clear()
+  await state.set_state(AdminStates.waiting_page_jump)
+  await state.update_data(page_jump_target="queue", operator_key=operator_key, total_pages=total_pages)
+  await callback.message.answer(
+    f"<b>🔢 Переход к странице очереди</b>\n\n"
+    f"Текущая страница: <b>{current_page + 1}</b>\n"
+    f"Всего страниц: <b>{total_pages}</b>\n\n"
+    f"Отправьте номер страницы цифрой."
+  )
+  await callback.answer()
+
+
+@router.callback_query(F.data.startswith("admin:qr_jump:"))
+async def admin_qr_jump_prompt(callback: CallbackQuery, state: FSMContext):
+  if not is_admin(callback.from_user.id):
+    return
+  parts = callback.data.split(":")
+  try:
+    current_index = int(parts[2]) if len(parts) > 2 else 0
+  except Exception:
+    current_index = 0
+  operator_key = parts[3] if len(parts) > 3 else "all"
+  rows, total = qr_page_items(0, 1, operator_key)
+  total_pages = max(1, int(total))
+  await state.clear()
+  await state.set_state(AdminStates.waiting_page_jump)
+  await state.update_data(page_jump_target="qr", operator_key=operator_key, total_pages=total_pages)
+  await callback.message.answer(
+    f"<b>🔢 Переход к странице QR</b>\n\n"
+    f"Текущая страница: <b>{current_index + 1}</b>\n"
+    f"Всего страниц: <b>{total_pages}</b>\n\n"
+    f"Отправьте номер страницы цифрой."
+  )
+  await callback.answer()
+
+
+@router.message(AdminStates.waiting_page_jump)
+async def admin_page_jump_receive(message: Message, state: FSMContext):
+  if not is_admin(message.from_user.id):
+    await state.clear()
+    return
+  raw = (message.text or '').strip()
+  if not raw.isdigit():
+    await message.answer("Отправьте номер страницы цифрой, например: <code>3</code>")
+    return
+  page_number = int(raw)
+  data = await state.get_data()
+  total_pages = max(1, int(data.get("total_pages", 1)))
+  operator_key = data.get("operator_key", "all")
+  target = data.get("page_jump_target", "queue")
+  if page_number < 1 or page_number > total_pages:
+    await message.answer(f"Страница должна быть от <b>1</b> до <b>{total_pages}</b>.")
+    return
+  await state.clear()
+  page_index = page_number - 1
+  if target == "qr":
+    await open_qr_browser_message(message, page_index, operator_key)
+  else:
+    await message.answer(render_admin_queue_text(page_index, operator_key), reply_markup=queue_manage_kb(page_index, operator_key))
 
 @router.callback_query(F.data == "admin:queues")
 async def admin_queues(callback: CallbackQuery):
   if not is_admin(callback.from_user.id):
     return
-  await safe_edit_or_send(callback, render_admin_queue_text(), reply_markup=queue_manage_kb())
+  await safe_edit_or_send(callback, render_admin_queue_text(0, "all"), reply_markup=queue_manage_kb(0, "all"))
+  await callback.answer()
+
+@router.callback_query(F.data.startswith("admin:queue_filter:"))
+async def admin_queue_filter(callback: CallbackQuery):
+  if not is_admin(callback.from_user.id):
+    return
+  parts = callback.data.split(":")
+  operator_key = parts[2] if len(parts) > 2 else "all"
+  try:
+    page = int(parts[3]) if len(parts) > 3 else 0
+  except Exception:
+    page = 0
+  await safe_edit_or_send(callback, render_admin_queue_text(page, operator_key), reply_markup=queue_manage_kb(page, operator_key))
+  await callback.answer()
+
+@router.callback_query(F.data.startswith("admin:queues:"))
+async def admin_queues_nav(callback: CallbackQuery):
+  if not is_admin(callback.from_user.id):
+    return
+  parts = callback.data.split(":")
+  if len(parts) >= 3 and parts[2] == "noop":
+    await callback.answer()
+    return
+  try:
+    page = int(parts[2]) if len(parts) > 2 else 0
+  except Exception:
+    page = 0
+  operator_key = parts[3] if len(parts) > 3 else "all"
+  await safe_edit_or_send(callback, render_admin_queue_text(page, operator_key), reply_markup=queue_manage_kb(page, operator_key))
   await callback.answer()
 
 @router.callback_query(F.data.startswith("admin:queue_view:"))
 async def admin_queue_view(callback: CallbackQuery):
   if not is_admin(callback.from_user.id):
     return
+  parts = callback.data.split(":")
   try:
-    item_id = int(callback.data.rsplit(":", 1)[1])
+    item_id = int(parts[2])
   except Exception:
     await callback.answer("Некорректный ID", show_alert=True)
     return
-  await send_admin_queue_preview(callback.message, item_id)
-  await callback.answer()
-
-@router.callback_query(F.data.startswith("admin:queue_view:"))
-async def admin_queue_view(callback: CallbackQuery):
-  if not is_admin(callback.from_user.id):
-    return
   try:
-    item_id = int(callback.data.rsplit(":", 1)[1])
+    back_page = int(parts[3]) if len(parts) > 3 else 0
   except Exception:
-    await callback.answer("Некорректный ID", show_alert=True)
-    return
-  await send_admin_queue_preview(callback.message, item_id)
+    back_page = 0
+  back_operator = parts[4] if len(parts) > 4 else "all"
+  await send_admin_queue_preview(callback.message, item_id, back_page, back_operator)
   await callback.answer()
 
 @router.callback_query(F.data == "admin:user_tools")
@@ -7923,9 +8106,15 @@ async def admin_toggle_numbers(callback: CallbackQuery):
 async def admin_queue_remove(callback: CallbackQuery):
   if not is_admin(callback.from_user.id):
     return
-  item_id = int(callback.data.split(":")[-1])
+  parts = callback.data.split(":")
+  item_id = int(parts[2])
+  try:
+    page = int(parts[3]) if len(parts) > 3 else 0
+  except Exception:
+    page = 0
+  operator_key = parts[4] if len(parts) > 4 else "all"
   remove_queue_item(item_id, reason='admin_removed', admin_id=callback.from_user.id)
-  await safe_edit_or_send(callback, render_admin_queue_text(), reply_markup=queue_manage_kb())
+  await safe_edit_or_send(callback, render_admin_queue_text(page, operator_key), reply_markup=queue_manage_kb(page, operator_key))
   await callback.answer("Удалено из очереди")
 
 @router.callback_query(F.data.startswith("myremove:"))
