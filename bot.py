@@ -243,16 +243,26 @@ class QueueItem:
 class Database:
   def __init__(self, path: str):
     self.path = path
+    self._ensure_db_dir()
     self.conn = sqlite3.connect(path)
     self.conn.row_factory = sqlite3.Row
     self.create_tables()
     self.seed_defaults()
+
+  def _ensure_db_dir(self):
+    try:
+      parent = Path(self.path).expanduser().resolve().parent
+    except Exception:
+      parent = Path(self.path).parent
+    if str(parent) not in ('', '.'): 
+      parent.mkdir(parents=True, exist_ok=True)
 
   def reconnect(self):
     try:
       self.conn.close()
     except Exception:
       pass
+    self._ensure_db_dir()
     self.conn = sqlite3.connect(self.path)
     self.conn.row_factory = sqlite3.Row
 
