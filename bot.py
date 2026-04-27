@@ -1720,20 +1720,50 @@ def user_admin_kb():
   return kb.as_markup()
 
 
-def admin_operator_filter_buttons(kb: InlineKeyboardBuilder, prefix: str, current_operator: str = "all", page: int = 0):
+def _start_of_today_str() -> str:
+  return datetime.now().strftime("%Y-%m-%d 00:00:00")
+
+
+def admin_operator_filter_buttons(kb: InlineKeyboardBuilder, prefix: str, current_operator: str = "all", page: int = 0, status_filter: str = "all", day_filter: str = "all", mode_filter: str = "all"):
   buttons = [("Все", "all")] + [(OPERATORS[key]['title'], key) for key in OPERATORS.keys()]
   for title, key in buttons:
-    marker = "✅ " if key == current_operator else ""
-    kb.button(text=(marker + title)[:32], callback_data=f"{prefix}:{key}:{page}")
+    marker = "• " if key == current_operator else ""
+    kb.button(text=(marker + title)[:32], callback_data=f"{prefix}:{key}:{status_filter}:{day_filter}:{page}:{mode_filter}")
 
 
-def queue_page_items(page: int = 0, per_page: int = 10, operator_key: str = "all"):
+def admin_scope_filter_buttons(kb: InlineKeyboardBuilder, prefix: str, current_operator: str = "all", status_filter: str = "all", day_filter: str = "all", mode_filter: str = "all"):
+  all_mark = "• " if status_filter == "all" else ""
+  queue_mark = "• " if status_filter == "queued" else ""
+  whole_mark = "• " if day_filter == "all" else ""
+  today_mark = "• " if day_filter == "today" else ""
+  kb.button(text=(all_mark + "Все статусы")[:32], callback_data=f"{prefix}:{current_operator}:all:{day_filter}:0:{mode_filter}")
+  kb.button(text=(queue_mark + "Только в очереди")[:32], callback_data=f"{prefix}:{current_operator}:queued:{day_filter}:0:{mode_filter}")
+  kb.button(text=(whole_mark + "За всё время")[:32], callback_data=f"{prefix}:{current_operator}:{status_filter}:all:0:{mode_filter}")
+  kb.button(text=(today_mark + "За сегодня")[:32], callback_data=f"{prefix}:{current_operator}:{status_filter}:today:0:{mode_filter}")
+
+
+def admin_mode_filter_buttons(kb: InlineKeyboardBuilder, prefix: str, current_operator: str = "all", status_filter: str = "all", day_filter: str = "all", mode_filter: str = "all"):
+  all_mark = "• " if mode_filter == "all" else ""
+  hold_mark = "• " if mode_filter == "hold" else ""
+  no_hold_mark = "• " if mode_filter == "no_hold" else ""
+  kb.button(text=(all_mark + "Все режимы")[:32], callback_data=f"{prefix}:{current_operator}:{status_filter}:{day_filter}:0:all")
+  kb.button(text=(hold_mark + "Только холд")[:32], callback_data=f"{prefix}:{current_operator}:{status_filter}:{day_filter}:0:hold")
+  kb.button(text=(no_hold_mark + "Только без холда")[:32], callback_data=f"{prefix}:{current_operator}:{status_filter}:{day_filter}:0:no_hold")
+
+
+def queue_page_items(page: int = 0, per_page: int = 10, operator_key: str = "all", day_filter: str = "all", mode_filter: str = "all"):
   page = max(0, int(page))
   params = []
   where = "WHERE status='queued'"
   if operator_key != "all":
     where += " AND operator_key=?"
     params.append(operator_key)
+  if mode_filter in {"hold", "no_hold"}:
+    where += " AND mode=?"
+    params.append(mode_filter)
+  if day_filter == "today":
+    where += " AND created_at>=?"
+    params.append(_start_of_today_str())
   total = db.conn.execute(f"SELECT COUNT(*) AS c FROM queue_items {where}", tuple(params)).fetchone()['c'] or 0
   offset = page * per_page
   rows = db.conn.execute(
@@ -1743,29 +1773,32 @@ def queue_page_items(page: int = 0, per_page: int = 10, operator_key: str = "all
   return rows, int(total)
 
 
-def queue_manage_kb(page: int = 0, operator_key: str = "all"):
+def queue_manage_kb(page: int = 0, operator_key: str = "all", day_filter: str = "all", mode_filter: str = "all"):
   kb = InlineKeyboardBuilder()
-  items, total = queue_page_items(page, 10, operator_key)
-  admin_operator_filter_buttons(kb, "admin:queue_filter", operator_key, page)
+  items, total = queue_page_items(page, 10, operator_key, day_filter, mode_filter)
+  admin_operator_filter_buttons(kb, "admin:queue_filter", operator_key, page, "queued", day_filter, mode_filter)
+  admin_scope_filter_buttons(kb, "admin:queue_filter", operator_key, "queued", day_filter, mode_filter)
+  admin_mode_filter_buttons(kb, "admin:queue_filter", operator_key, "queued", day_filter, mode_filter)
   for item in items:
-    label = f"#{item['id']} {op_text(item['operator_key'])} {mode_label(item['mode'])}"
-    kb.button(text=f"👁 {label}"[:64], callback_data=f"admin:queue_view:{item['id']}:{page}:{operator_key}")
-    kb.button(text=f"🗑 {label}"[:64], callback_data=f"admin:queue_remove:{item['id']}:{page}:{operator_key}")
+    short_op = op_text(item['operator_key']).replace('🟡 ', '').replace('⚫ ', '').replace('🟢 ', '').replace('🔴 ', '').replace('🔵 ', '').replace('⚪ ', '')
+    label = f"#{item['id']} • {short_op} • {pretty_phone(item['normalized_phone'])}"
+    kb.button(text=f"👁 {label}"[:64], callback_data=f"admin:queue_view:{item['id']}:{page}:{operator_key}:{day_filter}:{mode_filter}")
+    kb.button(text=f"🗑 {label}"[:64], callback_data=f"admin:queue_remove:{item['id']}:{page}:{operator_key}:{day_filter}:{mode_filter}")
   total_pages = max(1, (int(total) + 9) // 10)
   safe_page = min(max(0, int(page)), total_pages - 1)
   prev_page = safe_page - 1 if safe_page > 0 else total_pages - 1
   next_page = safe_page + 1 if safe_page < total_pages - 1 else 0
-  kb.button(text="⬅️", callback_data=f"admin:queues:{prev_page}:{operator_key}")
-  kb.button(text=f"{safe_page + 1}/{total_pages}", callback_data="admin:queues:noop")
-  kb.button(text="➡️", callback_data=f"admin:queues:{next_page}:{operator_key}")
-  kb.button(text="🔄 Обновить список", callback_data=f"admin:queues:{safe_page}:{operator_key}")
-  kb.button(text="🔢 Ввести страницу", callback_data=f"admin:queue_jump:{safe_page}:{operator_key}")
-  kb.button(text="🖼 Общий просмотр QR", callback_data=f"admin:qr_numbers:0:{operator_key}")
+  kb.button(text="⬅️", callback_data=f"admin:queues:{prev_page}:{operator_key}:{day_filter}:{mode_filter}")
+  kb.button(text=f"Стр. {safe_page + 1}/{total_pages}", callback_data="admin:queues:noop")
+  kb.button(text="➡️", callback_data=f"admin:queues:{next_page}:{operator_key}:{day_filter}:{mode_filter}")
+  kb.button(text="🔢 Страница", callback_data=f"admin:queue_jump:{safe_page}:{operator_key}:{day_filter}:{mode_filter}")
+  kb.button(text="🔄 Обновить", callback_data=f"admin:queues:{safe_page}:{operator_key}:{day_filter}:{mode_filter}")
+  kb.button(text="🖼 QR и номера", callback_data=f"admin:qr_numbers:0:{operator_key}:queued:{day_filter}:{mode_filter}")
   kb.button(text="↩️ Назад", callback_data="admin:home")
   if items:
-    kb.adjust(3, *([2] * len(items)), 3, 1, 1, 1, 1)
+    kb.adjust(3, 2, 3, *([2] * len(items)), 3, 3, 1)
   else:
-    kb.adjust(3, 3, 1, 1, 1, 1)
+    kb.adjust(3, 2, 3, 3, 3, 1)
   return kb.as_markup()
 
 
@@ -3228,7 +3261,7 @@ def render_workspaces() -> str:
 
 
 def mode_label(mode: str) -> str:
-  return "Холд" if mode == "hold" else "БезХолд"
+  return "Холд" if mode == "hold" else "Без холда"
 
 
 def mode_emoji(mode: str) -> str:
@@ -7541,22 +7574,40 @@ async def hold_watcher(bot: Bot):
     await asyncio.sleep(5)
 
 
-def recent_qr_items(limit: int = 50, operator_key: str = "all"):
+def recent_qr_items(limit: int = 50, operator_key: str = "all", status_filter: str = "all", day_filter: str = "all", mode_filter: str = "all"):
   params = []
-  where = ""
+  clauses = []
   if operator_key != "all":
-    where = "WHERE operator_key=?"
+    clauses.append("operator_key=?")
     params.append(operator_key)
+  if status_filter == "queued":
+    clauses.append("status='queued'")
+  if mode_filter in {"hold", "no_hold"}:
+    clauses.append("mode=?")
+    params.append(mode_filter)
+  if day_filter == "today":
+    clauses.append("created_at>=?")
+    params.append(_start_of_today_str())
+  where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
   return db.conn.execute(f"SELECT * FROM queue_items {where} ORDER BY id DESC LIMIT ?", tuple(params + [limit])).fetchall()
 
 
-def qr_page_items(page: int = 0, per_page: int = 1, operator_key: str = "all"):
+def qr_page_items(page: int = 0, per_page: int = 1, operator_key: str = "all", status_filter: str = "all", day_filter: str = "all", mode_filter: str = "all"):
   page = max(0, int(page))
   params = []
-  where = ""
+  clauses = []
   if operator_key != "all":
-    where = "WHERE operator_key=?"
+    clauses.append("operator_key=?")
     params.append(operator_key)
+  if status_filter == "queued":
+    clauses.append("status='queued'")
+  if mode_filter in {"hold", "no_hold"}:
+    clauses.append("mode=?")
+    params.append(mode_filter)
+  if day_filter == "today":
+    clauses.append("created_at>=?")
+    params.append(_start_of_today_str())
+  where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
   total = db.conn.execute(f"SELECT COUNT(*) AS c FROM queue_items {where}", tuple(params)).fetchone()['c'] or 0
   offset = page * per_page
   rows = db.conn.execute(
@@ -7566,19 +7617,21 @@ def qr_page_items(page: int = 0, per_page: int = 1, operator_key: str = "all"):
   return rows, int(total)
 
 
-def admin_qr_browser_kb(index: int, total: int, operator_key: str = "all"):
+def admin_qr_browser_kb(index: int, total: int, operator_key: str = "all", status_filter: str = "all", day_filter: str = "all", mode_filter: str = "all"):
   kb = InlineKeyboardBuilder()
-  admin_operator_filter_buttons(kb, "admin:qr_filter", operator_key, index)
+  admin_operator_filter_buttons(kb, "admin:qr_filter", operator_key, index, status_filter, day_filter, mode_filter)
+  admin_scope_filter_buttons(kb, "admin:qr_filter", operator_key, status_filter, day_filter, mode_filter)
+  admin_mode_filter_buttons(kb, "admin:qr_filter", operator_key, status_filter, day_filter, mode_filter)
   prev_i = index - 1 if index > 0 else total - 1
   next_i = index + 1 if index < total - 1 else 0
-  kb.button(text="⬅️", callback_data=f"admin:qr_numbers:{prev_i}:{operator_key}")
-  kb.button(text=f"{index + 1}/{total}", callback_data="admin:qr_numbers:noop")
-  kb.button(text="➡️", callback_data=f"admin:qr_numbers:{next_i}:{operator_key}")
-  kb.button(text="🔄 Обновить", callback_data=f"admin:qr_numbers:{index}:{operator_key}")
-  kb.button(text="🔢 Ввести страницу", callback_data=f"admin:qr_jump:{index}:{operator_key}")
-  kb.button(text="📦 К очереди", callback_data=f"admin:queues:0:{operator_key}")
+  kb.button(text="⬅️", callback_data=f"admin:qr_numbers:{prev_i}:{operator_key}:{status_filter}:{day_filter}:{mode_filter}")
+  kb.button(text=f"Стр. {index + 1}/{total}", callback_data="admin:qr_numbers:noop")
+  kb.button(text="➡️", callback_data=f"admin:qr_numbers:{next_i}:{operator_key}:{status_filter}:{day_filter}:{mode_filter}")
+  kb.button(text="🔢 Страница", callback_data=f"admin:qr_jump:{index}:{operator_key}:{status_filter}:{day_filter}:{mode_filter}")
+  kb.button(text="🔄 Обновить", callback_data=f"admin:qr_numbers:{index}:{operator_key}:{status_filter}:{day_filter}:{mode_filter}")
+  kb.button(text="📦 К очереди", callback_data=f"admin:queues:0:{operator_key}:{day_filter}:{mode_filter}")
   kb.button(text="↩️ Назад", callback_data="admin:home")
-  kb.adjust(3,3,1,1,1)
+  kb.adjust(3, 2, 3, 3, 3, 1)
   return kb.as_markup()
 
 
@@ -7590,7 +7643,7 @@ def render_qr_browser_caption(item) -> str:
   phone = pretty_phone(item['normalized_phone'])
   operator = op_text(item['operator_key'])
   mode = mode_label(item['mode'])
-  status = item['status']
+  status = status_label_from_row(item)
   created = item['created_at']
   user_line = (
     f"<b>👤 Человек:</b> {escape(name)}\n"
@@ -7608,24 +7661,24 @@ def render_qr_browser_caption(item) -> str:
     + user_line
   )
 
-async def open_qr_browser_message(message: Message, index: int = 0, operator_key: str = "all"):
-  rows, total = qr_page_items(index, 1, operator_key)
+async def open_qr_browser_message(message: Message, index: int = 0, operator_key: str = "all", status_filter: str = "all", day_filter: str = "all", mode_filter: str = "all"):
+  rows, total = qr_page_items(index, 1, operator_key, status_filter, day_filter, mode_filter)
   if not rows:
-    await message.answer("<b>🖼 QR и номера</b>\n\n<i>Заявок пока нет.</i>", reply_markup=admin_back_kb())
+    await message.answer("<b>🖼 QR и номера</b>\n\n<i>Заявок по выбранным фильтрам пока нет.</i>", reply_markup=admin_back_kb())
     return
   idx = max(0, min(index, total - 1))
   item = rows[0]
   caption = render_qr_browser_caption(item)
   try:
-    await send_queue_item_photo_to_chat(message.bot, message.chat.id, item, caption=caption, reply_markup=admin_qr_browser_kb(idx, total, operator_key), message_thread_id=getattr(message, 'message_thread_id', None))
+    await send_queue_item_photo_to_chat(message.bot, message.chat.id, item, caption=caption, reply_markup=admin_qr_browser_kb(idx, total, operator_key, status_filter, day_filter, mode_filter), message_thread_id=getattr(message, 'message_thread_id', None))
   except Exception:
     logging.exception('admin qr browser photo preview failed')
-    await message.answer(caption + "\n\n<i>QR preview недоступен.</i>", reply_markup=admin_qr_browser_kb(idx, total, operator_key))
+    await message.answer(caption + "\n\n<i>QR preview недоступен.</i>", reply_markup=admin_qr_browser_kb(idx, total, operator_key, status_filter, day_filter, mode_filter))
 
-async def update_qr_browser_message(callback: CallbackQuery, index: int = 0, operator_key: str = "all"):
-  rows, total = qr_page_items(index, 1, operator_key)
+async def update_qr_browser_message(callback: CallbackQuery, index: int = 0, operator_key: str = "all", status_filter: str = "all", day_filter: str = "all", mode_filter: str = "all"):
+  rows, total = qr_page_items(index, 1, operator_key, status_filter, day_filter, mode_filter)
   if not rows:
-    await safe_edit_or_send(callback, "<b>🖼 QR и номера</b>\n\n<i>Заявок пока нет.</i>", reply_markup=admin_back_kb())
+    await safe_edit_or_send(callback, "<b>🖼 QR и номера</b>\n\n<i>Заявок по выбранным фильтрам пока нет.</i>", reply_markup=admin_back_kb())
     return
   idx = max(0, min(index, total - 1))
   item = rows[0]
@@ -7636,34 +7689,43 @@ async def update_qr_browser_message(callback: CallbackQuery, index: int = 0, ope
         await callback.message.delete()
       except Exception:
         pass
-    await send_queue_item_photo_to_chat(callback.bot, callback.message.chat.id, item, caption=caption, reply_markup=admin_qr_browser_kb(idx, total, operator_key), message_thread_id=getattr(callback.message, 'message_thread_id', None))
+    await send_queue_item_photo_to_chat(callback.bot, callback.message.chat.id, item, caption=caption, reply_markup=admin_qr_browser_kb(idx, total, operator_key, status_filter, day_filter, mode_filter), message_thread_id=getattr(callback.message, 'message_thread_id', None))
   except Exception:
     logging.exception('admin qr browser nav photo preview failed')
-    await callback.message.answer(caption + "\n\n<i>QR preview недоступен.</i>", reply_markup=admin_qr_browser_kb(idx, total, operator_key))
+    await callback.message.answer(caption + "\n\n<i>QR preview недоступен.</i>", reply_markup=admin_qr_browser_kb(idx, total, operator_key, status_filter, day_filter, mode_filter))
 
-def render_admin_queue_text(page: int = 0, operator_key: str = "all") -> str:
-  items, total = queue_page_items(page, 10, operator_key)
+def render_admin_queue_text(page: int = 0, operator_key: str = "all", day_filter: str = "all", mode_filter: str = "all") -> str:
+  items, total = queue_page_items(page, 10, operator_key, day_filter, mode_filter)
   total_pages = max(1, (int(total) + 9) // 10)
   safe_page = min(max(0, int(page)), total_pages - 1)
+  filters = []
+  if operator_key != 'all':
+    filters.append(escape(op_text(operator_key)))
+  if day_filter == 'today':
+    filters.append('сегодня')
+  if mode_filter == 'hold':
+    filters.append('холд')
+  elif mode_filter == 'no_hold':
+    filters.append('без холда')
   if not items:
-    title = "<b>📦 Очередь</b>"
-    if operator_key != 'all':
-      title += f"\n<b>Фильтр:</b> {escape(op_text(operator_key))}"
-    return title + "\n\n<i>Активных заявок в очереди нет.</i>"
+    title = "<b>📦 Очередь</b>\n<b>Статус:</b> queued"
+    if filters:
+      title += f"\n<b>Фильтры:</b> {' • '.join(filters)}"
+    return title + "\n\n<i>Заявок в очереди по выбранным фильтрам нет.</i>"
   rows = []
   for item in items:
     pos = queue_position(item['id']) if item['status'] == 'queued' else None
     pos_text = f" • позиция {pos}" if pos else ""
     rows.append(f"#{item['id']} • {op_text(item['operator_key'])} • {mode_label(item['mode'])} • {pretty_phone(item['normalized_phone'])}{pos_text}")
-  header = f"<b>📦 Очередь</b>\n<b>Страница:</b> {safe_page + 1}/{total_pages}"
-  if operator_key != 'all':
-    header += f"\n<b>Фильтр:</b> {escape(op_text(operator_key))}"
+  header = f"<b>📦 Очередь</b>\n<b>Страница:</b> {safe_page + 1}/{total_pages}\n<b>Статус:</b> queued"
+  if filters:
+    header += f"\n<b>Фильтры:</b> {' • '.join(filters)}"
   return header + "\n\n" + quote_block(rows)
 
-async def send_admin_queue_preview(target_message: Message, item_id: int, back_page: int = 0, back_operator: str = "all"):
+async def send_admin_queue_preview(target_message: Message, item_id: int, back_page: int = 0, back_operator: str = "all", back_day_filter: str = "all", back_mode_filter: str = "all"):
   item = db.get_queue_item(int(item_id))
   if not item:
-    await target_message.answer("<b>👁 Просмотр заявки</b>\n\n<i>Заявка не найдена.</i>", reply_markup=queue_manage_kb(back_page, back_operator))
+    await target_message.answer("<b>👁 Просмотр заявки</b>\n\n<i>Заявка не найдена.</i>", reply_markup=queue_manage_kb(back_page, back_operator, back_day_filter, back_mode_filter))
     return
   caption = (
     f"<b>👁 Просмотр заявки без взятия</b>\n\n"
@@ -7671,20 +7733,20 @@ async def send_admin_queue_preview(target_message: Message, item_id: int, back_p
     f"<b>📱 Оператор:</b> {escape(op_text(item['operator_key']))}\n"
     f"<b>🧾 Режим:</b> {escape(mode_label(item['mode']))}\n"
     f"<b>☎️ Номер:</b> <code>{pretty_phone(item['normalized_phone'])}</code>\n"
-    f"<b>📍 Статус:</b> {escape(item['status'])}\n"
+    f"<b>📍 Статус:</b> {escape(status_label_from_row(item))}\n"
     f"<b>🕒 Создано:</b> {escape(item['created_at'])}"
   )
   try:
-    await send_queue_item_photo_to_chat(target_message.bot, target_message.chat.id, item, caption=caption, reply_markup=queue_manage_kb(back_page, back_operator), message_thread_id=getattr(target_message, 'message_thread_id', None))
+    await send_queue_item_photo_to_chat(target_message.bot, target_message.chat.id, item, caption=caption, reply_markup=queue_manage_kb(back_page, back_operator, back_day_filter, back_mode_filter), message_thread_id=getattr(target_message, 'message_thread_id', None))
   except Exception:
     logging.exception('admin queue preview photo failed')
-    await target_message.answer(caption + "\n\n<i>QR preview недоступен.</i>", reply_markup=queue_manage_kb(back_page, back_operator))
+    await target_message.answer(caption + "\n\n<i>QR preview недоступен.</i>", reply_markup=queue_manage_kb(back_page, back_operator, back_day_filter, back_mode_filter))
 
 @router.callback_query(F.data == "admin:qr_numbers")
 async def admin_qr_numbers(callback: CallbackQuery):
   if not is_admin(callback.from_user.id):
     return
-  await open_qr_browser_message(callback.message, 0, "all")
+  await open_qr_browser_message(callback.message, 0, "all", "all", "all", "all")
   await callback.answer()
 
 @router.callback_query(F.data.startswith("admin:qr_filter:"))
@@ -7693,11 +7755,14 @@ async def admin_qr_filter(callback: CallbackQuery):
     return
   parts = callback.data.split(":")
   operator_key = parts[2] if len(parts) > 2 else "all"
+  status_filter = parts[3] if len(parts) > 3 else "all"
+  day_filter = parts[4] if len(parts) > 4 else "all"
   try:
-    idx = int(parts[3]) if len(parts) > 3 else 0
+    idx = int(parts[5]) if len(parts) > 5 else 0
   except Exception:
     idx = 0
-  await update_qr_browser_message(callback, idx, operator_key)
+  mode_filter = parts[6] if len(parts) > 6 else "all"
+  await update_qr_browser_message(callback, idx, operator_key, status_filter, day_filter, mode_filter)
   await callback.answer()
 
 @router.callback_query(F.data.startswith("admin:qr_numbers:"))
@@ -7713,7 +7778,10 @@ async def admin_qr_numbers_nav(callback: CallbackQuery):
   except Exception:
     idx = 0
   operator_key = tail[3] if len(tail) > 3 else "all"
-  await update_qr_browser_message(callback, idx, operator_key)
+  status_filter = tail[4] if len(tail) > 4 else "all"
+  day_filter = tail[5] if len(tail) > 5 else "all"
+  mode_filter = tail[6] if len(tail) > 6 else "all"
+  await update_qr_browser_message(callback, idx, operator_key, status_filter, day_filter, mode_filter)
   await callback.answer()
 
 
@@ -7727,11 +7795,13 @@ async def admin_queue_jump_prompt(callback: CallbackQuery, state: FSMContext):
   except Exception:
     current_page = 0
   operator_key = parts[3] if len(parts) > 3 else "all"
-  items, total = queue_page_items(0, 10, operator_key)
+  day_filter = parts[4] if len(parts) > 4 else "all"
+  mode_filter = parts[5] if len(parts) > 5 else "all"
+  items, total = queue_page_items(0, 10, operator_key, day_filter, mode_filter)
   total_pages = max(1, (int(total) + 9) // 10)
   await state.clear()
   await state.set_state(AdminStates.waiting_page_jump)
-  await state.update_data(page_jump_target="queue", operator_key=operator_key, total_pages=total_pages)
+  await state.update_data(page_jump_target="queue", operator_key=operator_key, day_filter=day_filter, mode_filter=mode_filter, total_pages=total_pages)
   await callback.message.answer(
     f"<b>🔢 Переход к странице очереди</b>\n\n"
     f"Текущая страница: <b>{current_page + 1}</b>\n"
@@ -7751,11 +7821,14 @@ async def admin_qr_jump_prompt(callback: CallbackQuery, state: FSMContext):
   except Exception:
     current_index = 0
   operator_key = parts[3] if len(parts) > 3 else "all"
-  rows, total = qr_page_items(0, 1, operator_key)
+  status_filter = parts[4] if len(parts) > 4 else "all"
+  day_filter = parts[5] if len(parts) > 5 else "all"
+  mode_filter = parts[6] if len(parts) > 6 else "all"
+  rows, total = qr_page_items(0, 1, operator_key, status_filter, day_filter, mode_filter)
   total_pages = max(1, int(total))
   await state.clear()
   await state.set_state(AdminStates.waiting_page_jump)
-  await state.update_data(page_jump_target="qr", operator_key=operator_key, total_pages=total_pages)
+  await state.update_data(page_jump_target="qr", operator_key=operator_key, status_filter=status_filter, day_filter=day_filter, mode_filter=mode_filter, total_pages=total_pages)
   await callback.message.answer(
     f"<b>🔢 Переход к странице QR</b>\n\n"
     f"Текущая страница: <b>{current_index + 1}</b>\n"
@@ -7778,22 +7851,25 @@ async def admin_page_jump_receive(message: Message, state: FSMContext):
   data = await state.get_data()
   total_pages = max(1, int(data.get("total_pages", 1)))
   operator_key = data.get("operator_key", "all")
+  status_filter = data.get("status_filter", "all")
+  day_filter = data.get("day_filter", "all")
   target = data.get("page_jump_target", "queue")
+  mode_filter = data.get("mode_filter", "all")
   if page_number < 1 or page_number > total_pages:
     await message.answer(f"Страница должна быть от <b>1</b> до <b>{total_pages}</b>.")
     return
   await state.clear()
   page_index = page_number - 1
   if target == "qr":
-    await open_qr_browser_message(message, page_index, operator_key)
+    await open_qr_browser_message(message, page_index, operator_key, status_filter, day_filter, mode_filter)
   else:
-    await message.answer(render_admin_queue_text(page_index, operator_key), reply_markup=queue_manage_kb(page_index, operator_key))
+    await message.answer(render_admin_queue_text(page_index, operator_key, day_filter, mode_filter), reply_markup=queue_manage_kb(page_index, operator_key, day_filter, mode_filter))
 
 @router.callback_query(F.data == "admin:queues")
 async def admin_queues(callback: CallbackQuery):
   if not is_admin(callback.from_user.id):
     return
-  await safe_edit_or_send(callback, render_admin_queue_text(0, "all"), reply_markup=queue_manage_kb(0, "all"))
+  await safe_edit_or_send(callback, render_admin_queue_text(0, "all", "all", "all"), reply_markup=queue_manage_kb(0, "all", "all", "all"))
   await callback.answer()
 
 @router.callback_query(F.data.startswith("admin:queue_filter:"))
@@ -7802,11 +7878,13 @@ async def admin_queue_filter(callback: CallbackQuery):
     return
   parts = callback.data.split(":")
   operator_key = parts[2] if len(parts) > 2 else "all"
+  day_filter = parts[4] if len(parts) > 4 else "all"
   try:
-    page = int(parts[3]) if len(parts) > 3 else 0
+    page = int(parts[5]) if len(parts) > 5 else 0
   except Exception:
     page = 0
-  await safe_edit_or_send(callback, render_admin_queue_text(page, operator_key), reply_markup=queue_manage_kb(page, operator_key))
+  mode_filter = parts[6] if len(parts) > 6 else "all"
+  await safe_edit_or_send(callback, render_admin_queue_text(page, operator_key, day_filter, mode_filter), reply_markup=queue_manage_kb(page, operator_key, day_filter, mode_filter))
   await callback.answer()
 
 @router.callback_query(F.data.startswith("admin:queues:"))
@@ -7822,7 +7900,9 @@ async def admin_queues_nav(callback: CallbackQuery):
   except Exception:
     page = 0
   operator_key = parts[3] if len(parts) > 3 else "all"
-  await safe_edit_or_send(callback, render_admin_queue_text(page, operator_key), reply_markup=queue_manage_kb(page, operator_key))
+  day_filter = parts[4] if len(parts) > 4 else "all"
+  mode_filter = parts[5] if len(parts) > 5 else "all"
+  await safe_edit_or_send(callback, render_admin_queue_text(page, operator_key, day_filter, mode_filter), reply_markup=queue_manage_kb(page, operator_key, day_filter, mode_filter))
   await callback.answer()
 
 @router.callback_query(F.data.startswith("admin:queue_view:"))
@@ -7840,7 +7920,9 @@ async def admin_queue_view(callback: CallbackQuery):
   except Exception:
     back_page = 0
   back_operator = parts[4] if len(parts) > 4 else "all"
-  await send_admin_queue_preview(callback.message, item_id, back_page, back_operator)
+  back_day_filter = parts[5] if len(parts) > 5 else "all"
+  back_mode_filter = parts[6] if len(parts) > 6 else "all"
+  await send_admin_queue_preview(callback.message, item_id, back_page, back_operator, back_day_filter, back_mode_filter)
   await callback.answer()
 
 @router.callback_query(F.data == "admin:user_tools")
@@ -8113,8 +8195,9 @@ async def admin_queue_remove(callback: CallbackQuery):
   except Exception:
     page = 0
   operator_key = parts[4] if len(parts) > 4 else "all"
+  day_filter = parts[5] if len(parts) > 5 else "all"
   remove_queue_item(item_id, reason='admin_removed', admin_id=callback.from_user.id)
-  await safe_edit_or_send(callback, render_admin_queue_text(page, operator_key), reply_markup=queue_manage_kb(page, operator_key))
+  await safe_edit_or_send(callback, render_admin_queue_text(page, operator_key, day_filter), reply_markup=queue_manage_kb(page, operator_key, day_filter))
   await callback.answer("Удалено из очереди")
 
 @router.callback_query(F.data.startswith("myremove:"))
