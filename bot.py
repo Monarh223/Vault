@@ -3650,9 +3650,7 @@ async def send_queue_item_photo_to_chat(target_bot: Bot, chat_id: int, item, cap
         except Exception:
           logging.exception('download+reupload qr failed; item_id=%s ref=%r token_tail=%s', getattr(item, 'id', None) if hasattr(item, 'id') else (item['id'] if hasattr(item, 'keys') and 'id' in item.keys() else None), ref, (token[-6:] if isinstance(token, str) and len(token) >= 6 else token))
     logging.warning('qr photo unavailable, sending text fallback; item_id=%s refs=%r', getattr(item, 'id', None) if hasattr(item, 'id') else (item['id'] if hasattr(item, 'keys') and 'id' in item.keys() else None), refs)
-    return await target_bot.send_message(chat_id, caption + "
-
-⚠️ Фото QR сейчас недоступно.", reply_markup=reply_markup, message_thread_id=message_thread_id)
+    return await target_bot.send_message(chat_id, caption + "\n\n⚠️ Фото QR сейчас недоступно.", reply_markup=reply_markup, message_thread_id=message_thread_id)
   finally:
     if close_after and source_bot is not None:
       await source_bot.session.close()
@@ -9242,4 +9240,16 @@ async def main():
 
 
 if __name__ == "__main__":
-  asyncio.run(main())
+  try:
+    asyncio.run(main())
+  except Exception as e:
+    import traceback
+    print("FATAL STARTUP ERROR:", repr(e), flush=True)
+    traceback.print_exc()
+    try:
+      with open("startup_crash.log", "a", encoding="utf-8") as f:
+        f.write("FATAL STARTUP ERROR:\n")
+        traceback.print_exc(file=f)
+    except Exception:
+      pass
+    raise
