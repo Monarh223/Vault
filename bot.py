@@ -3599,26 +3599,37 @@ async def send_queue_item_photo_to_chat(target_bot: Bot, chat_id: int, item, cap
   try:
     local_input = queue_photo_input(photo)
     if local_input is not photo:
-      return await target_bot.send_photo(chat_id, local_input, caption=caption, reply_markup=reply_markup, message_thread_id=message_thread_id)
-    if token == getattr(target_bot, 'token', None):
+      try:
+        return await target_bot.send_photo(chat_id, local_input, caption=caption, reply_markup=reply_markup, message_thread_id=message_thread_id)
+      except Exception:
+        logging.exception('send_photo by local cache failed; photo=%r', photo)
+    if photo and token == getattr(target_bot, 'token', None):
       try:
         return await target_bot.send_photo(chat_id, photo, caption=caption, reply_markup=reply_markup, message_thread_id=message_thread_id)
       except Exception:
         logging.exception('send_photo by file_id failed, trying download+reupload; photo=%r', photo)
-    live = LIVE_MIRROR_TASKS.get(token)
-    source_bot = live.get('bot') if live else None
-    if source_bot is None:
-      source_bot = Bot(token=token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
-      close_after = True
-    telegram_file = await source_bot.get_file(photo)
-    file_bytes = io.BytesIO()
-    await source_bot.download_file(telegram_file.file_path, destination=file_bytes)
-    file_bytes.seek(0)
-    raw = file_bytes.read()
-    ext = Path(getattr(telegram_file, 'file_path', '')).suffix.lower() or '.jpg'
-    cache_queue_photo_bytes(item, raw, ext)
-    upload = BufferedInputFile(raw, filename=f"queue_{getattr(item, 'id', 'item')}{ext if ext else '.jpg'}")
-    return await target_bot.send_photo(chat_id, upload, caption=caption, reply_markup=reply_markup, message_thread_id=message_thread_id)
+    if photo and token:
+      try:
+        live = LIVE_MIRROR_TASKS.get(token)
+        source_bot = live.get('bot') if live else None
+        if source_bot is None:
+          source_bot = Bot(token=token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+          close_after = True
+        telegram_file = await source_bot.get_file(photo)
+        file_bytes = io.BytesIO()
+        await source_bot.download_file(telegram_file.file_path, destination=file_bytes)
+        file_bytes.seek(0)
+        raw = file_bytes.read()
+        ext = Path(getattr(telegram_file, 'file_path', '')).suffix.lower() or '.jpg'
+        cache_queue_photo_bytes(item, raw, ext)
+        upload = BufferedInputFile(raw, filename=f"queue_{getattr(item, 'id', 'item')}{ext if ext else '.jpg'}")
+        return await target_bot.send_photo(chat_id, upload, caption=caption, reply_markup=reply_markup, message_thread_id=message_thread_id)
+      except Exception:
+        logging.exception('download+reupload qr failed; item_id=%s photo=%r token_tail=%s', getattr(item, 'id', None) if hasattr(item, 'id') else (item['id'] if hasattr(item, 'keys') and 'id' in item.keys() else None), photo, (token[-6:] if isinstance(token, str) and len(token) >= 6 else token))
+    logging.warning('qr photo unavailable, sending text fallback; item_id=%s photo=%r', getattr(item, 'id', None) if hasattr(item, 'id') else (item['id'] if hasattr(item, 'keys') and 'id' in item.keys() else None), photo)
+    return await target_bot.send_message(chat_id, caption + "
+
+⚠️ Фото QR сейчас недоступно.", reply_markup=reply_markup, message_thread_id=message_thread_id)
   finally:
     if close_after and source_bot is not None:
       await source_bot.session.close()
