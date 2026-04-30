@@ -271,11 +271,16 @@ class Database:
     temp_uploaded = Path(uploaded_path)
     backup_path = Path(self.path + '.backup')
     current_path = Path(self.path)
+    preserved_workspaces = []
     if current_path.exists():
       try:
         self.conn.commit()
       except Exception:
         pass
+      try:
+        preserved_workspaces = [dict(r) for r in self.conn.execute("SELECT * FROM workspaces WHERE is_enabled=1").fetchall()]
+      except Exception:
+        preserved_workspaces = []
       shutil.copyfile(current_path, backup_path)
     try:
       self.conn.close()
@@ -290,6 +295,27 @@ class Database:
       ensure_extra_schema()
     except Exception:
       pass
+    if preserved_workspaces:
+      try:
+        existing = self.conn.execute("SELECT COUNT(*) AS c FROM workspaces WHERE is_enabled=1").fetchone()
+        if int((existing['c'] if existing else 0) or 0) == 0:
+          for row in preserved_workspaces:
+            self.conn.execute(
+              """INSERT INTO workspaces (chat_id, thread_id, mode, is_enabled, added_by, created_at, chat_title, thread_title) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+              (
+                row.get('chat_id'),
+                row.get('thread_id', -1),
+                row.get('mode', 'group'),
+                row.get('is_enabled', 1),
+                row.get('added_by'),
+                row.get('created_at') or now_str(),
+                row.get('chat_title'),
+                row.get('thread_title'),
+              ),
+            )
+          self.conn.commit()
+      except Exception:
+        logging.exception('restore preserved workspaces failed after db replace')
     try:
       reload_operators_from_db()
     except Exception:
@@ -1332,7 +1358,7 @@ def my_numbers_kb(items):
   kb = InlineKeyboardBuilder()
   for item in items[:10]:
     if item['status'] == 'queued':
-      kb.button(text=f"🗑 Убрать #{item['id']}", callback_data=f"myremove:{item['id']}")
+      kb.button(text=f"🗑 Убрать #{queue_item_value(item, 'id')}", callback_data=f"myremove:{queue_item_value(item, 'id')}")
   kb.button(text="🔄 Обновить список", callback_data="menu:my")
   kb.button(text="🏠 На главную", callback_data="menu:home")
   kb.adjust(1)
@@ -1781,9 +1807,9 @@ def queue_manage_kb(page: int = 0, operator_key: str = "all", day_filter: str = 
   admin_mode_filter_buttons(kb, "admin:queue_filter", operator_key, "queued", day_filter, mode_filter)
   for item in items:
     short_op = op_text(item['operator_key']).replace('🟡 ', '').replace('⚫ ', '').replace('🟢 ', '').replace('🔴 ', '').replace('🔵 ', '').replace('⚪ ', '')
-    label = f"#{item['id']} • {short_op} • {pretty_phone(item['normalized_phone'])}"
-    kb.button(text=f"👁 {label}"[:64], callback_data=f"admin:queue_view:{item['id']}:{page}:{operator_key}:{day_filter}:{mode_filter}")
-    kb.button(text=f"🗑 {label}"[:64], callback_data=f"admin:queue_remove:{item['id']}:{page}:{operator_key}:{day_filter}:{mode_filter}")
+    label = f"#{queue_item_value(item, 'id')} • {short_op} • {pretty_phone(queue_item_value(item, 'normalized_phone'))}"
+    kb.button(text=f"👁 {label}"[:64], callback_data=f"admin:queue_view:{queue_item_value(item, 'id')}:{page}:{operator_key}:{day_filter}:{mode_filter}")
+    kb.button(text=f"🗑 {label}"[:64], callback_data=f"admin:queue_remove:{queue_item_value(item, 'id')}:{page}:{operator_key}:{day_filter}:{mode_filter}")
   total_pages = max(1, (int(total) + 9) // 10)
   safe_page = min(max(0, int(page)), total_pages - 1)
   prev_page = safe_page - 1 if safe_page > 0 else total_pages - 1
@@ -2398,8 +2424,8 @@ async def api_submit_esim(request):
     raw = qr.file.read()
     if not raw:
       return web.json_response({'ok': False, 'error': 'Пустой файл QR.'}, status=400)
-    uploads_dir = Path('miniapp_uploads')
-    uploads_dir.mkdir(exist_ok=True)
+    uploads_dir = queue_photo_cache_dir()
+    uploads_dir.mkdir(parents=True, exist_ok=True)
     ext = Path(getattr(qr, 'filename', 'qr.jpg') or 'qr.jpg').suffix.lower() or '.jpg'
     if ext not in {'.jpg', '.jpeg', '.png', '.webp'}:
       ext = '.jpg'
@@ -3454,7 +3480,7 @@ def queue_order_sql(prefix: str = "") -> str:
 def create_queue_item_ext(user_id: int, username: str, full_name: str, operator_key: str, normalized_phone: str, qr_file_id: str, mode: str, submit_bot_token: str | None = None):
   cur = db.conn.cursor()
   qi_cols = {r['name'] for r in db.conn.execute("PRAGMA table_info(queue_items)").fetchall()}
-  local_ref = qr_file_id if isinstance(qr_file_id, str) and qr_file_id.startswith('local:') else None
+  local_ref = qr_file_id if queue_photo_input(qr_file_id) is not qr_file_id else None
   if 'qr_local_path' in qi_cols:
     cur.execute(
       """
@@ -3645,11 +3671,11 @@ async def send_queue_item_photo_to_chat(target_bot: Bot, chat_id: int, item, cap
           raw = file_bytes.read()
           ext = Path(getattr(telegram_file, 'file_path', '')).suffix.lower() or '.jpg'
           cache_queue_photo_bytes(item, raw, ext)
-          upload = BufferedInputFile(raw, filename=f"queue_{getattr(item, 'id', 'item') if hasattr(item, 'id') else (item['id'] if hasattr(item, 'keys') and 'id' in item.keys() else 'item')}{ext if ext else '.jpg'}")
+          upload = BufferedInputFile(raw, filename=f"queue_{queue_item_value(item, 'id', 'item')}{ext if ext else '.jpg'}")
           return await target_bot.send_photo(chat_id, upload, caption=caption, reply_markup=reply_markup, message_thread_id=message_thread_id)
         except Exception:
-          logging.exception('download+reupload qr failed; item_id=%s ref=%r token_tail=%s', getattr(item, 'id', None) if hasattr(item, 'id') else (item['id'] if hasattr(item, 'keys') and 'id' in item.keys() else None), ref, (token[-6:] if isinstance(token, str) and len(token) >= 6 else token))
-    logging.warning('qr photo unavailable, sending text fallback; item_id=%s refs=%r', getattr(item, 'id', None) if hasattr(item, 'id') else (item['id'] if hasattr(item, 'keys') and 'id' in item.keys() else None), refs)
+          logging.exception('download+reupload qr failed; item_id=%s ref=%r token_tail=%s', getattr(item, 'id', None) if hasattr(item, 'id') else (queue_item_value(item, 'id') if hasattr(item, 'keys') and 'id' in item.keys() else None), ref, (token[-6:] if isinstance(token, str) and len(token) >= 6 else token))
+    logging.warning('qr photo unavailable, sending text fallback; item_id=%s refs=%r', getattr(item, 'id', None) if hasattr(item, 'id') else (queue_item_value(item, 'id') if hasattr(item, 'keys') and 'id' in item.keys() else None), refs)
     return await target_bot.send_message(chat_id, caption + "\n\n⚠️ Фото QR сейчас недоступно.", reply_markup=reply_markup, message_thread_id=message_thread_id)
   finally:
     if close_after and source_bot is not None:
@@ -3680,16 +3706,23 @@ def queue_item_photo_refs(item) -> list[str]:
   refs: list[str] = []
   keys = ('qr_local_path', 'qr_path', 'photo_path', 'qr_file_path', 'qr_file_id')
   for key in keys:
-    value = None
-    if hasattr(item, key):
-      value = getattr(item, key)
-    elif hasattr(item, 'keys') and key in item.keys():
-      value = item[key]
+    value = queue_item_value(item, key)
     if isinstance(value, str):
       value = value.strip()
     if value and value not in refs:
       refs.append(value)
   return refs
+
+
+def queue_item_value(item, key: str, default=None):
+  if hasattr(item, key):
+    return getattr(item, key)
+  if hasattr(item, 'keys') and key in item.keys():
+    try:
+      return item[key]
+    except Exception:
+      return default
+  return default
 
 
 def queue_photo_input(photo):
@@ -3699,9 +3732,11 @@ def queue_photo_input(photo):
       if raw.startswith(prefix):
         raw = raw.split(':', 1)[1].strip()
         break
-    if raw and (raw.startswith('/') or raw.startswith('./') or raw.startswith('../')):
+    if raw:
       try:
         path = Path(raw)
+        if not path.is_absolute():
+          path = (Path.cwd() / path).resolve()
         if path.exists() and path.is_file():
           return FSInputFile(path.as_posix())
       except Exception:
@@ -3715,11 +3750,7 @@ def cache_queue_photo_bytes(item, raw: bytes, ext: str = '.jpg') -> str | None:
     safe_ext = (ext or '.jpg').lower()
     if safe_ext not in {'.jpg', '.jpeg', '.png', '.webp'}:
       safe_ext = '.jpg'
-    item_id = None
-    if hasattr(item, 'id'):
-      item_id = getattr(item, 'id')
-    elif hasattr(item, 'keys') and 'id' in item.keys():
-      item_id = item['id']
+    item_id = queue_item_value(item, 'id')
     safe_name = f"queue_{item_id or int(time.time()*1000)}{safe_ext}"
     target = uploads_dir / safe_name
     target.write_bytes(raw)
@@ -4614,15 +4645,15 @@ async def takeop_callback(callback: CallbackQuery):
     return
   # item may already be taken by mode helper; otherwise take it now
   if item['status'] == 'queued':
-    if not db.take_queue_item(item['id'], callback.from_user.id):
+    if not db.take_queue_item(queue_item_value(item, 'id'), callback.from_user.id):
       await callback.answer("Заявку уже забрали", show_alert=True)
       return
-    item = db.get_queue_item(item['id'])
+    item = db.get_queue_item(queue_item_value(item, 'id'))
   caption = queue_caption(item) + "\n\n👇 Выберите нужное действие:"
   if getattr(callback.message, 'photo', None):
-    await callback.message.answer_photo(queue_photo_input(item['qr_file_id']), caption=caption, reply_markup=admin_queue_kb(item))
+    await callback.message.answer_photo(queue_photo_input(queue_item_value(item, 'qr_file_id')), caption=caption, reply_markup=admin_queue_kb(item))
   else:
-    await callback.message.answer_photo(queue_photo_input(item['qr_file_id']), caption=caption, reply_markup=admin_queue_kb(item))
+    await callback.message.answer_photo(queue_photo_input(queue_item_value(item, 'qr_file_id')), caption=caption, reply_markup=admin_queue_kb(item))
   await callback.answer()
 
 
@@ -4726,10 +4757,11 @@ async def persist_message_qr_photo(message: Message) -> str:
     target = uploads_dir / safe_name
     raw = file_bytes.read()
     target.write_bytes(raw)
-    logging.info('qr photo cached locally: %s', target.as_posix())
-    return f"local:{target.as_posix()}"
+    local_ref = f"local:{target.as_posix()}"
+    logging.info('qr photo cached locally: %s (file_id=%s)', target.as_posix(), file_id)
+    return local_ref
   except Exception:
-    logging.exception('persist_message_qr_photo failed; fallback to file_id')
+    logging.exception('persist_message_qr_photo failed; fallback to file_id=%s', file_id)
     return file_id
 
 @router.message(SubmitStates.waiting_qr, F.photo)
@@ -6125,15 +6157,15 @@ async def takeop_callback(callback: CallbackQuery):
     return
   # item may already be taken by mode helper; otherwise take it now
   if item['status'] == 'queued':
-    if not db.take_queue_item(item['id'], callback.from_user.id):
+    if not db.take_queue_item(queue_item_value(item, 'id'), callback.from_user.id):
       await callback.answer("Заявку уже забрали", show_alert=True)
       return
-    item = db.get_queue_item(item['id'])
+    item = db.get_queue_item(queue_item_value(item, 'id'))
   caption = queue_caption(item) + "\n\n👇 Выберите нужное действие:"
   if getattr(callback.message, 'photo', None):
-    await callback.message.answer_photo(queue_photo_input(item['qr_file_id']), caption=caption, reply_markup=admin_queue_kb(item))
+    await callback.message.answer_photo(queue_photo_input(queue_item_value(item, 'qr_file_id')), caption=caption, reply_markup=admin_queue_kb(item))
   else:
-    await callback.message.answer_photo(queue_photo_input(item['qr_file_id']), caption=caption, reply_markup=admin_queue_kb(item))
+    await callback.message.answer_photo(queue_photo_input(queue_item_value(item, 'qr_file_id')), caption=caption, reply_markup=admin_queue_kb(item))
   await callback.answer()
 
 
@@ -7784,7 +7816,7 @@ def render_qr_browser_caption(item) -> str:
   )
   return (
     f"<b>🖼 QR и номера</b>\n\n"
-    f"<b>📌 Заявка:</b> <code>#{item['id']}</code>\n"
+    f"<b>📌 Заявка:</b> <code>#{queue_item_value(item, 'id')}</code>\n"
     f"<b>📱 Оператор:</b> {escape(operator)}\n"
     f"<b>🧾 Режим:</b> {escape(mode)}\n"
     f"<b>☎️ Номер:</b> <code>{phone}</code>\n"
@@ -7804,7 +7836,7 @@ async def open_qr_browser_message(message: Message, index: int = 0, operator_key
   try:
     await send_queue_item_photo_to_chat(message.bot, message.chat.id, item, caption=caption, reply_markup=admin_qr_browser_kb(idx, total, operator_key, status_filter, day_filter, mode_filter), message_thread_id=getattr(message, 'message_thread_id', None))
   except Exception:
-    logging.exception('admin qr browser photo send failed for item_id=%s qr=%r', item['id'] if hasattr(item, 'keys') else getattr(item, 'id', None), item['qr_file_id'] if hasattr(item, 'keys') else getattr(item, 'qr_file_id', None))
+    logging.exception('admin qr browser photo send failed for item_id=%s qr=%r', queue_item_value(item, 'id') if hasattr(item, 'keys') else getattr(item, 'id', None), queue_item_value(item, 'qr_file_id') if hasattr(item, 'keys') else getattr(item, 'qr_file_id', None))
     await message.answer(caption + "\n\n<i>QR preview недоступен.</i>", reply_markup=admin_qr_browser_kb(idx, total, operator_key, status_filter, day_filter, mode_filter))
 
 async def update_qr_browser_message(callback: CallbackQuery, index: int = 0, operator_key: str = "all", status_filter: str = "all", day_filter: str = "all", mode_filter: str = "all"):
@@ -7823,7 +7855,7 @@ async def update_qr_browser_message(callback: CallbackQuery, index: int = 0, ope
         pass
     await send_queue_item_photo_to_chat(callback.bot, callback.message.chat.id, item, caption=caption, reply_markup=admin_qr_browser_kb(idx, total, operator_key, status_filter, day_filter, mode_filter), message_thread_id=getattr(callback.message, 'message_thread_id', None))
   except Exception:
-    logging.exception('admin qr browser nav photo send failed for item_id=%s qr=%r', item['id'] if hasattr(item, 'keys') else getattr(item, 'id', None), item['qr_file_id'] if hasattr(item, 'keys') else getattr(item, 'qr_file_id', None))
+    logging.exception('admin qr browser nav photo send failed for item_id=%s qr=%r', queue_item_value(item, 'id') if hasattr(item, 'keys') else getattr(item, 'id', None), queue_item_value(item, 'qr_file_id') if hasattr(item, 'keys') else getattr(item, 'qr_file_id', None))
     await callback.message.answer(caption + "\n\n<i>QR preview недоступен.</i>", reply_markup=admin_qr_browser_kb(idx, total, operator_key, status_filter, day_filter, mode_filter))
 
 def render_admin_queue_text(page: int = 0, operator_key: str = "all", day_filter: str = "all", mode_filter: str = "all") -> str:
@@ -7846,9 +7878,9 @@ def render_admin_queue_text(page: int = 0, operator_key: str = "all", day_filter
     return title + "\n\n<i>Заявок в очереди по выбранным фильтрам нет.</i>"
   rows = []
   for item in items:
-    pos = queue_position(item['id']) if item['status'] == 'queued' else None
+    pos = queue_position(queue_item_value(item, 'id')) if item['status'] == 'queued' else None
     pos_text = f" • позиция {pos}" if pos else ""
-    rows.append(f"#{item['id']} • {op_text(item['operator_key'])} • {mode_label(item['mode'])} • {pretty_phone(item['normalized_phone'])}{pos_text}")
+    rows.append(f"#{queue_item_value(item, 'id')} • {op_text(item['operator_key'])} • {mode_label(item['mode'])} • {pretty_phone(queue_item_value(item, 'normalized_phone'))}{pos_text}")
   header = f"<b>📦 Очередь</b>\n<b>Страница:</b> {safe_page + 1}/{total_pages}\n<b>Статус:</b> queued"
   if filters:
     header += f"\n<b>Фильтры:</b> {' • '.join(filters)}"
@@ -7861,12 +7893,12 @@ async def send_admin_queue_preview(target_message: Message, item_id: int, back_p
     return
   caption = (
     f"<b>👁 Просмотр заявки без взятия</b>\n\n"
-    f"<b>📌 ID:</b> <code>#{item['id']}</code>\n"
-    f"<b>📱 Оператор:</b> {escape(op_text(item['operator_key']))}\n"
-    f"<b>🧾 Режим:</b> {escape(mode_label(item['mode']))}\n"
-    f"<b>☎️ Номер:</b> <code>{pretty_phone(item['normalized_phone'])}</code>\n"
+    f"<b>📌 ID:</b> <code>#{queue_item_value(item, 'id')}</code>\n"
+    f"<b>📱 Оператор:</b> {escape(op_text(queue_item_value(item, 'operator_key')))}\n"
+    f"<b>🧾 Режим:</b> {escape(mode_label(queue_item_value(item, 'mode')))}\n"
+    f"<b>☎️ Номер:</b> <code>{pretty_phone(queue_item_value(item, 'normalized_phone'))}</code>\n"
     f"<b>📍 Статус:</b> {escape(status_label_from_row(item))}\n"
-    f"<b>🕒 Создано:</b> {escape(item['created_at'])}"
+    f"<b>🕒 Создано:</b> {escape(str(queue_item_value(item, 'created_at', '')))}"
   )
   try:
     await send_queue_item_photo_to_chat(target_message.bot, target_message.chat.id, item, caption=caption, reply_markup=queue_manage_kb(back_page, back_operator, back_day_filter, back_mode_filter), message_thread_id=getattr(target_message, 'message_thread_id', None))
