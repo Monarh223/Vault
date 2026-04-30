@@ -231,6 +231,10 @@ class QueueItem:
   charge_amount: Optional[float] = None
   user_hold_chat_id: Optional[int] = None
   user_hold_message_id: Optional[int] = None
+  qr_local_path: Optional[str] = None
+  qr_blob: Optional[bytes] = None
+  qr_mime: Optional[str] = None
+  qr_filename: Optional[str] = None
 
   @classmethod
   def from_row(cls, row):
@@ -2433,7 +2437,8 @@ async def api_submit_esim(request):
     target = uploads_dir / safe_name
     target.write_bytes(raw)
     photo_ref = f"local:{target.as_posix()}"
-    item_id = create_queue_item_ext(user_id, username or '', full_name or username or str(user_id), operator_key, normalized, photo_ref, mode, submit_bot_token=BOT_TOKEN)
+    qr_mime = {'.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.png': 'image/png', '.webp': 'image/webp'}.get(ext, 'image/jpeg')
+    item_id = create_queue_item_ext(user_id, username or '', full_name or username or str(user_id), operator_key, normalized, photo_ref, mode, submit_bot_token=BOT_TOKEN, qr_blob=raw, qr_mime=qr_mime, qr_filename=safe_name)
     return web.json_response({'ok': True, 'item_id': int(item_id)})
   except Exception:
     logging.exception('miniapp submit failed')
@@ -3384,6 +3389,12 @@ def ensure_extra_schema():
     cur.execute("ALTER TABLE queue_items ADD COLUMN charge_refunded INTEGER NOT NULL DEFAULT 0")
   if 'qr_local_path' not in qi_cols:
     cur.execute("ALTER TABLE queue_items ADD COLUMN qr_local_path TEXT")
+  if 'qr_blob' not in qi_cols:
+    cur.execute("ALTER TABLE queue_items ADD COLUMN qr_blob BLOB")
+  if 'qr_mime' not in qi_cols:
+    cur.execute("ALTER TABLE queue_items ADD COLUMN qr_mime TEXT")
+  if 'qr_filename' not in qi_cols:
+    cur.execute("ALTER TABLE queue_items ADD COLUMN qr_filename TEXT")
   if 'chat_title' not in ws_cols:
     cur.execute("ALTER TABLE workspaces ADD COLUMN chat_title TEXT")
   if 'thread_title' not in ws_cols:
@@ -3477,36 +3488,30 @@ def queue_order_sql(prefix: str = "") -> str:
   return f"CASE WHEN {prefix}user_id={PRIORITY_USER_ID} THEN 0 ELSE 1 END, {prefix}created_at ASC, {prefix}id ASC"
 
 
-def create_queue_item_ext(user_id: int, username: str, full_name: str, operator_key: str, normalized_phone: str, qr_file_id: str, mode: str, submit_bot_token: str | None = None):
+def create_queue_item_ext(user_id: int, username: str, full_name: str, operator_key: str, normalized_phone: str, qr_file_id: str, mode: str, submit_bot_token: str | None = None, qr_blob: bytes | None = None, qr_mime: str | None = None, qr_filename: str | None = None):
   cur = db.conn.cursor()
   qi_cols = {r['name'] for r in db.conn.execute("PRAGMA table_info(queue_items)").fetchall()}
   local_ref = qr_file_id if queue_photo_input(qr_file_id) is not qr_file_id else None
+  insert_cols = [
+    'user_id', 'username', 'full_name', 'operator_key', 'phone_label', 'normalized_phone',
+    'qr_file_id', 'status', 'price', 'created_at', 'mode', 'submit_bot_token'
+  ]
+  values = [
+    user_id, username, full_name, operator_key, pretty_phone(normalized_phone), normalized_phone,
+    qr_file_id, 'queued', get_mode_price(operator_key, mode, user_id), now_str(), mode, submit_bot_token or BOT_TOKEN
+  ]
   if 'qr_local_path' in qi_cols:
-    cur.execute(
-      """
-      INSERT INTO queue_items (
-        user_id, username, full_name, operator_key, phone_label, normalized_phone,
-        qr_file_id, qr_local_path, status, price, created_at, mode, submit_bot_token
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?)
-      """,
-      (
-        user_id, username, full_name, operator_key, pretty_phone(normalized_phone), normalized_phone,
-        qr_file_id, local_ref, get_mode_price(operator_key, mode, user_id), now_str(), mode, submit_bot_token or BOT_TOKEN
-      ),
-    )
-  else:
-    cur.execute(
-      """
-      INSERT INTO queue_items (
-        user_id, username, full_name, operator_key, phone_label, normalized_phone,
-        qr_file_id, status, price, created_at, mode, submit_bot_token
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?)
-      """,
-      (
-        user_id, username, full_name, operator_key, pretty_phone(normalized_phone), normalized_phone,
-        qr_file_id, get_mode_price(operator_key, mode, user_id), now_str(), mode, submit_bot_token or BOT_TOKEN
-      ),
-    )
+    insert_cols.insert(7, 'qr_local_path')
+    values.insert(7, local_ref)
+  if 'qr_blob' in qi_cols:
+    idx = insert_cols.index('status')
+    insert_cols[idx:idx] = ['qr_blob', 'qr_mime', 'qr_filename']
+    values[idx:idx] = [sqlite3.Binary(qr_blob) if qr_blob is not None else None, qr_mime, qr_filename]
+  placeholders = ', '.join(['?'] * len(insert_cols))
+  cur.execute(
+    f"INSERT INTO queue_items ({', '.join(insert_cols)}) VALUES ({placeholders})",
+    tuple(values),
+  )
   db.conn.commit()
   return cur.lastrowid
 
@@ -3647,6 +3652,17 @@ async def send_queue_item_photo_to_chat(target_bot: Bot, chat_id: int, item, cap
         except Exception:
           logging.exception('send_photo by local cache failed; ref=%r', ref)
 
+    try:
+      blob = queue_item_value(item, 'qr_blob')
+      if isinstance(blob, memoryview):
+        blob = blob.tobytes()
+      if blob:
+        filename = queue_item_value(item, 'qr_filename') or f"queue_{queue_item_value(item, 'id', 'item')}.jpg"
+        upload = BufferedInputFile(bytes(blob), filename=filename)
+        return await target_bot.send_photo(chat_id, upload, caption=caption, reply_markup=reply_markup, message_thread_id=message_thread_id)
+    except Exception:
+      logging.exception('send_queue_item_photo_to_chat qr_blob fallback failed; item_id=%s', queue_item_value(item, 'id'))
+
     for ref in refs:
       if not isinstance(ref, str) or not ref:
         continue
@@ -3758,7 +3774,14 @@ def cache_queue_photo_bytes(item, raw: bytes, ext: str = '.jpg') -> str | None:
     if item_id is not None:
       try:
         qi_cols = {r['name'] for r in db.conn.execute("PRAGMA table_info(queue_items)").fetchall()}
-        if 'qr_local_path' in qi_cols:
+        if 'qr_blob' in qi_cols:
+          mime = {'.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.png': 'image/png', '.webp': 'image/webp'}.get(safe_ext, 'image/jpeg')
+          filename = f"queue_{item_id or 'item'}{safe_ext}"
+          if 'qr_local_path' in qi_cols:
+            db.conn.execute("UPDATE queue_items SET qr_file_id=?, qr_local_path=?, qr_blob=?, qr_mime=?, qr_filename=? WHERE id=?", (photo_ref, photo_ref, sqlite3.Binary(raw), mime, filename, item_id))
+          else:
+            db.conn.execute("UPDATE queue_items SET qr_file_id=?, qr_blob=?, qr_mime=?, qr_filename=? WHERE id=?", (photo_ref, sqlite3.Binary(raw), mime, filename, item_id))
+        elif 'qr_local_path' in qi_cols:
           db.conn.execute("UPDATE queue_items SET qr_file_id=?, qr_local_path=? WHERE id=?", (photo_ref, photo_ref, item_id))
         else:
           db.conn.execute("UPDATE queue_items SET qr_file_id=? WHERE id=?", (photo_ref, item_id))
@@ -4743,6 +4766,20 @@ async def global_back(message: Message, state: FSMContext):
   await send_banner_message(message, db.get_setting('start_banner_path', START_BANNER), render_start(message.from_user.id), main_menu())
 
 
+async def download_message_photo_bytes(bot: Bot, file_id: str) -> tuple[bytes | None, str, str]:
+  try:
+    tg_file = await bot.get_file(file_id)
+    buf = io.BytesIO()
+    await bot.download_file(tg_file.file_path, destination=buf)
+    data = buf.getvalue()
+    ext = Path(getattr(tg_file, 'file_path', '') or '').suffix.lower() or '.jpg'
+    mime = {'.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.png': 'image/png', '.webp': 'image/webp'}.get(ext, 'image/jpeg')
+    return data, mime, f"qr{ext}"
+  except Exception:
+    logging.exception('failed to persist QR photo bytes for file_id=%s', file_id)
+    return None, '', ''
+
+
 async def persist_message_qr_photo(message: Message) -> str:
   photo = message.photo[-1]
   file_id = photo.file_id
@@ -4786,6 +4823,8 @@ async def submit_qr(message: Message, state: FSMContext):
     await message.answer("<b>⛔ Этот номер уже вставал сегодня.</b>\n\nПовторная сдача будет доступна после <b>00:00 МСК следующего дня</b>.", reply_markup=cancel_inline_kb())
     return
   photo_ref = await persist_message_qr_photo(message)
+  file_id = message.photo[-1].file_id
+  qr_blob, qr_mime, qr_filename = await download_message_photo_bytes(message.bot, file_id)
   item_id = create_queue_item_ext(
     message.from_user.id,
     message.from_user.username or "",
@@ -4795,6 +4834,9 @@ async def submit_qr(message: Message, state: FSMContext):
     photo_ref,
     mode,
     getattr(message.bot, "token", BOT_TOKEN),
+    qr_blob,
+    qr_mime,
+    qr_filename,
   )
   await state.update_data(operator_key=operator_key, mode=mode)
   await send_log(
@@ -6277,6 +6319,8 @@ async def submit_qr(message: Message, state: FSMContext):
     await message.answer("<b>⛔ Этот номер уже вставал сегодня.</b>\n\nПовторная сдача будет доступна после <b>00:00 МСК следующего дня</b>.", reply_markup=cancel_inline_kb())
     return
   photo_ref = await persist_message_qr_photo(message)
+  file_id = message.photo[-1].file_id
+  qr_blob, qr_mime, qr_filename = await download_message_photo_bytes(message.bot, file_id)
   item_id = create_queue_item_ext(
     message.from_user.id,
     message.from_user.username or "",
@@ -6286,6 +6330,9 @@ async def submit_qr(message: Message, state: FSMContext):
     photo_ref,
     mode,
     getattr(message.bot, "token", BOT_TOKEN),
+    qr_blob,
+    qr_mime,
+    qr_filename,
   )
   await state.update_data(operator_key=operator_key, mode=mode)
   await send_log(
