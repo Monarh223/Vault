@@ -3356,6 +3356,8 @@ def ensure_extra_schema():
     cur.execute("ALTER TABLE queue_items ADD COLUMN user_hold_message_id INTEGER")
   if 'charge_refunded' not in qi_cols:
     cur.execute("ALTER TABLE queue_items ADD COLUMN charge_refunded INTEGER NOT NULL DEFAULT 0")
+  if 'qr_local_path' not in qi_cols:
+    cur.execute("ALTER TABLE queue_items ADD COLUMN qr_local_path TEXT")
   if 'chat_title' not in ws_cols:
     cur.execute("ALTER TABLE workspaces ADD COLUMN chat_title TEXT")
   if 'thread_title' not in ws_cols:
@@ -3451,18 +3453,34 @@ def queue_order_sql(prefix: str = "") -> str:
 
 def create_queue_item_ext(user_id: int, username: str, full_name: str, operator_key: str, normalized_phone: str, qr_file_id: str, mode: str, submit_bot_token: str | None = None):
   cur = db.conn.cursor()
-  cur.execute(
-    """
-    INSERT INTO queue_items (
-      user_id, username, full_name, operator_key, phone_label, normalized_phone,
-      qr_file_id, status, price, created_at, mode, submit_bot_token
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?)
-    """,
-    (
-      user_id, username, full_name, operator_key, pretty_phone(normalized_phone), normalized_phone,
-      qr_file_id, get_mode_price(operator_key, mode, user_id), now_str(), mode, submit_bot_token or BOT_TOKEN
-    ),
-  )
+  qi_cols = {r['name'] for r in db.conn.execute("PRAGMA table_info(queue_items)").fetchall()}
+  local_ref = qr_file_id if isinstance(qr_file_id, str) and qr_file_id.startswith('local:') else None
+  if 'qr_local_path' in qi_cols:
+    cur.execute(
+      """
+      INSERT INTO queue_items (
+        user_id, username, full_name, operator_key, phone_label, normalized_phone,
+        qr_file_id, qr_local_path, status, price, created_at, mode, submit_bot_token
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?)
+      """,
+      (
+        user_id, username, full_name, operator_key, pretty_phone(normalized_phone), normalized_phone,
+        qr_file_id, local_ref, get_mode_price(operator_key, mode, user_id), now_str(), mode, submit_bot_token or BOT_TOKEN
+      ),
+    )
+  else:
+    cur.execute(
+      """
+      INSERT INTO queue_items (
+        user_id, username, full_name, operator_key, phone_label, normalized_phone,
+        qr_file_id, status, price, created_at, mode, submit_bot_token
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?)
+      """,
+      (
+        user_id, username, full_name, operator_key, pretty_phone(normalized_phone), normalized_phone,
+        qr_file_id, get_mode_price(operator_key, mode, user_id), now_str(), mode, submit_bot_token or BOT_TOKEN
+      ),
+    )
   db.conn.commit()
   return cur.lastrowid
 
@@ -3593,40 +3611,45 @@ async def send_queue_item_photo_to_chat(target_bot: Bot, chat_id: int, item, cap
   token = queue_item_submit_token(item)
   source_bot = None
   close_after = False
-  photo = getattr(item, 'qr_file_id', None)
-  if photo is None and hasattr(item, 'keys'):
-    photo = item['qr_file_id']
+  refs = queue_item_photo_refs(item)
   try:
-    local_input = queue_photo_input(photo)
-    if local_input is not photo:
-      try:
-        return await target_bot.send_photo(chat_id, local_input, caption=caption, reply_markup=reply_markup, message_thread_id=message_thread_id)
-      except Exception:
-        logging.exception('send_photo by local cache failed; photo=%r', photo)
-    if photo and token == getattr(target_bot, 'token', None):
-      try:
-        return await target_bot.send_photo(chat_id, photo, caption=caption, reply_markup=reply_markup, message_thread_id=message_thread_id)
-      except Exception:
-        logging.exception('send_photo by file_id failed, trying download+reupload; photo=%r', photo)
-    if photo and token:
-      try:
-        live = LIVE_MIRROR_TASKS.get(token)
-        source_bot = live.get('bot') if live else None
-        if source_bot is None:
-          source_bot = Bot(token=token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
-          close_after = True
-        telegram_file = await source_bot.get_file(photo)
-        file_bytes = io.BytesIO()
-        await source_bot.download_file(telegram_file.file_path, destination=file_bytes)
-        file_bytes.seek(0)
-        raw = file_bytes.read()
-        ext = Path(getattr(telegram_file, 'file_path', '')).suffix.lower() or '.jpg'
-        cache_queue_photo_bytes(item, raw, ext)
-        upload = BufferedInputFile(raw, filename=f"queue_{getattr(item, 'id', 'item')}{ext if ext else '.jpg'}")
-        return await target_bot.send_photo(chat_id, upload, caption=caption, reply_markup=reply_markup, message_thread_id=message_thread_id)
-      except Exception:
-        logging.exception('download+reupload qr failed; item_id=%s photo=%r token_tail=%s', getattr(item, 'id', None) if hasattr(item, 'id') else (item['id'] if hasattr(item, 'keys') and 'id' in item.keys() else None), photo, (token[-6:] if isinstance(token, str) and len(token) >= 6 else token))
-    logging.warning('qr photo unavailable, sending text fallback; item_id=%s photo=%r', getattr(item, 'id', None) if hasattr(item, 'id') else (item['id'] if hasattr(item, 'keys') and 'id' in item.keys() else None), photo)
+    for ref in refs:
+      local_input = queue_photo_input(ref)
+      if local_input is not ref:
+        try:
+          return await target_bot.send_photo(chat_id, local_input, caption=caption, reply_markup=reply_markup, message_thread_id=message_thread_id)
+        except Exception:
+          logging.exception('send_photo by local cache failed; ref=%r', ref)
+
+    for ref in refs:
+      if not isinstance(ref, str) or not ref:
+        continue
+      if ref.startswith(('local:', 'file:', 'path:', 'localfile:')):
+        continue
+      if token == getattr(target_bot, 'token', None):
+        try:
+          return await target_bot.send_photo(chat_id, ref, caption=caption, reply_markup=reply_markup, message_thread_id=message_thread_id)
+        except Exception:
+          logging.exception('send_photo by file_id failed, trying download+reupload; ref=%r', ref)
+      if token:
+        try:
+          live = LIVE_MIRROR_TASKS.get(token)
+          source_bot = live.get('bot') if live else None
+          if source_bot is None:
+            source_bot = Bot(token=token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+            close_after = True
+          telegram_file = await source_bot.get_file(ref)
+          file_bytes = io.BytesIO()
+          await source_bot.download_file(telegram_file.file_path, destination=file_bytes)
+          file_bytes.seek(0)
+          raw = file_bytes.read()
+          ext = Path(getattr(telegram_file, 'file_path', '')).suffix.lower() or '.jpg'
+          cache_queue_photo_bytes(item, raw, ext)
+          upload = BufferedInputFile(raw, filename=f"queue_{getattr(item, 'id', 'item') if hasattr(item, 'id') else (item['id'] if hasattr(item, 'keys') and 'id' in item.keys() else 'item')}{ext if ext else '.jpg'}")
+          return await target_bot.send_photo(chat_id, upload, caption=caption, reply_markup=reply_markup, message_thread_id=message_thread_id)
+        except Exception:
+          logging.exception('download+reupload qr failed; item_id=%s ref=%r token_tail=%s', getattr(item, 'id', None) if hasattr(item, 'id') else (item['id'] if hasattr(item, 'keys') and 'id' in item.keys() else None), ref, (token[-6:] if isinstance(token, str) and len(token) >= 6 else token))
+    logging.warning('qr photo unavailable, sending text fallback; item_id=%s refs=%r', getattr(item, 'id', None) if hasattr(item, 'id') else (item['id'] if hasattr(item, 'keys') and 'id' in item.keys() else None), refs)
     return await target_bot.send_message(chat_id, caption + "
 
 ⚠️ Фото QR сейчас недоступно.", reply_markup=reply_markup, message_thread_id=message_thread_id)
@@ -3655,11 +3678,36 @@ def queue_photo_cache_dir() -> Path:
   return fallback
 
 
+def queue_item_photo_refs(item) -> list[str]:
+  refs: list[str] = []
+  keys = ('qr_local_path', 'qr_path', 'photo_path', 'qr_file_path', 'qr_file_id')
+  for key in keys:
+    value = None
+    if hasattr(item, key):
+      value = getattr(item, key)
+    elif hasattr(item, 'keys') and key in item.keys():
+      value = item[key]
+    if isinstance(value, str):
+      value = value.strip()
+    if value and value not in refs:
+      refs.append(value)
+  return refs
+
+
 def queue_photo_input(photo):
-  if isinstance(photo, str) and photo.startswith('local:'):
-    path = photo.split(':', 1)[1]
-    if path and Path(path).exists():
-      return FSInputFile(path)
+  if isinstance(photo, str):
+    raw = photo.strip()
+    for prefix in ('local:', 'file:', 'path:', 'localfile:'):
+      if raw.startswith(prefix):
+        raw = raw.split(':', 1)[1].strip()
+        break
+    if raw and (raw.startswith('/') or raw.startswith('./') or raw.startswith('../')):
+      try:
+        path = Path(raw)
+        if path.exists() and path.is_file():
+          return FSInputFile(path.as_posix())
+      except Exception:
+        pass
   return photo
 
 
@@ -3680,7 +3728,11 @@ def cache_queue_photo_bytes(item, raw: bytes, ext: str = '.jpg') -> str | None:
     photo_ref = f"local:{target.as_posix()}"
     if item_id is not None:
       try:
-        db.conn.execute("UPDATE queue_items SET qr_file_id=? WHERE id=?", (photo_ref, item_id))
+        qi_cols = {r['name'] for r in db.conn.execute("PRAGMA table_info(queue_items)").fetchall()}
+        if 'qr_local_path' in qi_cols:
+          db.conn.execute("UPDATE queue_items SET qr_file_id=?, qr_local_path=? WHERE id=?", (photo_ref, photo_ref, item_id))
+        else:
+          db.conn.execute("UPDATE queue_items SET qr_file_id=? WHERE id=?", (photo_ref, item_id))
         db.conn.commit()
       except Exception:
         logging.exception('failed to persist local qr cache for item %s', item_id)
