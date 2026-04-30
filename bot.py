@@ -3599,26 +3599,61 @@ async def send_queue_item_photo_to_chat(target_bot: Bot, chat_id: int, item, cap
   try:
     local_input = queue_photo_input(photo)
     if local_input is not photo:
-      return await target_bot.send_photo(chat_id, local_input, caption=caption, reply_markup=reply_markup, message_thread_id=message_thread_id)
-    if token == getattr(target_bot, 'token', None):
+      try:
+        return await target_bot.send_photo(chat_id, local_input, caption=caption, reply_markup=reply_markup, message_thread_id=message_thread_id)
+      except Exception:
+        logging.exception('send_photo by local cache failed; photo=%r', photo)
+    if photo and token == getattr(target_bot, 'token', None):
       try:
         return await target_bot.send_photo(chat_id, photo, caption=caption, reply_markup=reply_markup, message_thread_id=message_thread_id)
       except Exception:
-        logging.exception('send_photo by file_id failed, trying download+reupload')
-    live = LIVE_MIRROR_TASKS.get(token)
-    source_bot = live.get('bot') if live else None
-    if source_bot is None:
-      source_bot = Bot(token=token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
-      close_after = True
-    telegram_file = await source_bot.get_file(photo)
-    file_bytes = io.BytesIO()
-    await source_bot.download_file(telegram_file.file_path, destination=file_bytes)
-    file_bytes.seek(0)
-    upload = BufferedInputFile(file_bytes.read(), filename=f"queue_{getattr(item, 'id', 'item')}.jpg")
-    return await target_bot.send_photo(chat_id, upload, caption=caption, reply_markup=reply_markup, message_thread_id=message_thread_id)
+        logging.exception('send_photo by file_id failed, trying download+reupload; photo=%r', photo)
+    if photo and token:
+      try:
+        live = LIVE_MIRROR_TASKS.get(token)
+        source_bot = live.get('bot') if live else None
+        if source_bot is None:
+          source_bot = Bot(token=token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+          close_after = True
+        telegram_file = await source_bot.get_file(photo)
+        file_bytes = io.BytesIO()
+        await source_bot.download_file(telegram_file.file_path, destination=file_bytes)
+        file_bytes.seek(0)
+        raw = file_bytes.read()
+        ext = Path(getattr(telegram_file, 'file_path', '')).suffix.lower() or '.jpg'
+        cache_queue_photo_bytes(item, raw, ext)
+        upload = BufferedInputFile(raw, filename=f"queue_{getattr(item, 'id', 'item')}{ext if ext else '.jpg'}")
+        return await target_bot.send_photo(chat_id, upload, caption=caption, reply_markup=reply_markup, message_thread_id=message_thread_id)
+      except Exception:
+        logging.exception('download+reupload qr failed; item_id=%s photo=%r token_tail=%s', getattr(item, 'id', None) if hasattr(item, 'id') else (item['id'] if hasattr(item, 'keys') and 'id' in item.keys() else None), photo, (token[-6:] if isinstance(token, str) and len(token) >= 6 else token))
+    logging.warning('qr photo unavailable, sending text fallback; item_id=%s photo=%r', getattr(item, 'id', None) if hasattr(item, 'id') else (item['id'] if hasattr(item, 'keys') and 'id' in item.keys() else None), photo)
+    return await target_bot.send_message(chat_id, caption + "
+
+⚠️ Фото QR сейчас недоступно.", reply_markup=reply_markup, message_thread_id=message_thread_id)
   finally:
     if close_after and source_bot is not None:
       await source_bot.session.close()
+
+def queue_photo_cache_dir() -> Path:
+  candidates: list[Path] = []
+  db_parent = Path(DB_PATH).expanduser().parent if DB_PATH else Path('.')
+  candidates.append(db_parent / 'queue_photo_cache')
+  candidates.append(Path('/data/queue_photo_cache'))
+  candidates.append(Path('/tmp/queue_photo_cache'))
+  candidates.append(Path('queue_photo_cache'))
+  for candidate in candidates:
+    try:
+      candidate.mkdir(parents=True, exist_ok=True)
+      test_file = candidate / '.write_test'
+      test_file.write_bytes(b'ok')
+      test_file.unlink(missing_ok=True)
+      return candidate
+    except Exception:
+      continue
+  fallback = Path('/tmp/queue_photo_cache')
+  fallback.mkdir(parents=True, exist_ok=True)
+  return fallback
+
 
 def queue_photo_input(photo):
   if isinstance(photo, str) and photo.startswith('local:'):
@@ -3626,6 +3661,33 @@ def queue_photo_input(photo):
     if path and Path(path).exists():
       return FSInputFile(path)
   return photo
+
+
+def cache_queue_photo_bytes(item, raw: bytes, ext: str = '.jpg') -> str | None:
+  try:
+    uploads_dir = queue_photo_cache_dir()
+    safe_ext = (ext or '.jpg').lower()
+    if safe_ext not in {'.jpg', '.jpeg', '.png', '.webp'}:
+      safe_ext = '.jpg'
+    item_id = None
+    if hasattr(item, 'id'):
+      item_id = getattr(item, 'id')
+    elif hasattr(item, 'keys') and 'id' in item.keys():
+      item_id = item['id']
+    safe_name = f"queue_{item_id or int(time.time()*1000)}{safe_ext}"
+    target = uploads_dir / safe_name
+    target.write_bytes(raw)
+    photo_ref = f"local:{target.as_posix()}"
+    if item_id is not None:
+      try:
+        db.conn.execute("UPDATE queue_items SET qr_file_id=? WHERE id=?", (photo_ref, item_id))
+        db.conn.commit()
+      except Exception:
+        logging.exception('failed to persist local qr cache for item %s', item_id)
+    return photo_ref
+  except Exception:
+    logging.exception('cache_queue_photo_bytes failed')
+    return None
 
 def group_price_for_take(chat_id: int, thread_id: int | None, operator_key: str, mode: str) -> float:
   price = db.get_group_price(chat_id, thread_id, operator_key, mode)
@@ -4600,6 +4662,26 @@ async def global_back(message: Message, state: FSMContext):
   await send_banner_message(message, db.get_setting('start_banner_path', START_BANNER), render_start(message.from_user.id), main_menu())
 
 
+async def persist_message_qr_photo(message: Message) -> str:
+  photo = message.photo[-1]
+  file_id = photo.file_id
+  try:
+    telegram_file = await message.bot.get_file(file_id)
+    file_bytes = io.BytesIO()
+    await message.bot.download_file(telegram_file.file_path, destination=file_bytes)
+    file_bytes.seek(0)
+    ext = Path(getattr(telegram_file, 'file_path', '')).suffix.lower() or '.jpg'
+    uploads_dir = queue_photo_cache_dir()
+    safe_name = f"qr_{message.from_user.id}_{int(time.time()*1000)}{ext}"
+    target = uploads_dir / safe_name
+    raw = file_bytes.read()
+    target.write_bytes(raw)
+    logging.info('qr photo cached locally: %s', target.as_posix())
+    return f"local:{target.as_posix()}"
+  except Exception:
+    logging.exception('persist_message_qr_photo failed; fallback to file_id')
+    return file_id
+
 @router.message(SubmitStates.waiting_qr, F.photo)
 async def submit_qr(message: Message, state: FSMContext):
   caption = (message.caption or "").strip()
@@ -4621,14 +4703,14 @@ async def submit_qr(message: Message, state: FSMContext):
   if phone_locked_until_next_msk_day(phone):
     await message.answer("<b>⛔ Этот номер уже вставал сегодня.</b>\n\nПовторная сдача будет доступна после <b>00:00 МСК следующего дня</b>.", reply_markup=cancel_inline_kb())
     return
-  file_id = message.photo[-1].file_id
+  photo_ref = await persist_message_qr_photo(message)
   item_id = create_queue_item_ext(
     message.from_user.id,
     message.from_user.username or "",
     message.from_user.full_name,
     operator_key,
     phone,
-    file_id,
+    photo_ref,
     mode,
     getattr(message.bot, "token", BOT_TOKEN),
   )
@@ -6112,14 +6194,14 @@ async def submit_qr(message: Message, state: FSMContext):
   if phone_locked_until_next_msk_day(phone):
     await message.answer("<b>⛔ Этот номер уже вставал сегодня.</b>\n\nПовторная сдача будет доступна после <b>00:00 МСК следующего дня</b>.", reply_markup=cancel_inline_kb())
     return
-  file_id = message.photo[-1].file_id
+  photo_ref = await persist_message_qr_photo(message)
   item_id = create_queue_item_ext(
     message.from_user.id,
     message.from_user.username or "",
     message.from_user.full_name,
     operator_key,
     phone,
-    file_id,
+    photo_ref,
     mode,
     getattr(message.bot, "token", BOT_TOKEN),
   )
@@ -7672,7 +7754,7 @@ async def open_qr_browser_message(message: Message, index: int = 0, operator_key
   try:
     await send_queue_item_photo_to_chat(message.bot, message.chat.id, item, caption=caption, reply_markup=admin_qr_browser_kb(idx, total, operator_key, status_filter, day_filter, mode_filter), message_thread_id=getattr(message, 'message_thread_id', None))
   except Exception:
-    logging.exception('admin qr browser photo preview failed')
+    logging.exception('admin qr browser photo send failed for item_id=%s qr=%r', item['id'] if hasattr(item, 'keys') else getattr(item, 'id', None), item['qr_file_id'] if hasattr(item, 'keys') else getattr(item, 'qr_file_id', None))
     await message.answer(caption + "\n\n<i>QR preview недоступен.</i>", reply_markup=admin_qr_browser_kb(idx, total, operator_key, status_filter, day_filter, mode_filter))
 
 async def update_qr_browser_message(callback: CallbackQuery, index: int = 0, operator_key: str = "all", status_filter: str = "all", day_filter: str = "all", mode_filter: str = "all"):
@@ -7691,7 +7773,7 @@ async def update_qr_browser_message(callback: CallbackQuery, index: int = 0, ope
         pass
     await send_queue_item_photo_to_chat(callback.bot, callback.message.chat.id, item, caption=caption, reply_markup=admin_qr_browser_kb(idx, total, operator_key, status_filter, day_filter, mode_filter), message_thread_id=getattr(callback.message, 'message_thread_id', None))
   except Exception:
-    logging.exception('admin qr browser nav photo preview failed')
+    logging.exception('admin qr browser nav photo send failed for item_id=%s qr=%r', item['id'] if hasattr(item, 'keys') else getattr(item, 'id', None), item['qr_file_id'] if hasattr(item, 'keys') else getattr(item, 'qr_file_id', None))
     await callback.message.answer(caption + "\n\n<i>QR preview недоступен.</i>", reply_markup=admin_qr_browser_kb(idx, total, operator_key, status_filter, day_filter, mode_filter))
 
 def render_admin_queue_text(page: int = 0, operator_key: str = "all", day_filter: str = "all", mode_filter: str = "all") -> str:
