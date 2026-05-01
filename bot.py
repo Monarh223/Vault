@@ -83,6 +83,74 @@ BASE_OPERATORS = {
 }
 
 OPERATORS = {k: dict(v) for k, v in BASE_OPERATORS.items()}
+
+
+OPERATOR_KEY_ALIASES = {
+  "mts": "mts",
+  "мтс": "mts",
+  "mts_premium": "mts_premium",
+  "mtspremium": "mts_premium",
+  "mts premium": "mts_premium",
+  "mts_salon": "mts_premium",
+  "mtssalon": "mts_premium",
+  "mts salon": "mts_premium",
+  "мтс салон": "mts_premium",
+  "bil": "bil",
+  "beeline": "bil",
+  "билайн": "bil",
+  "mega": "mega",
+  "megafon": "mega",
+  "megafone": "mega",
+  "мегафон": "mega",
+  "t2": "t2",
+  "tele2": "t2",
+  "tele_2": "t2",
+  "теле2": "t2",
+  "tele2salon": "t2",
+  "tele2_salon": "t2",
+  "tele2 salon": "t2",
+  "tele2slaon": "t2",
+  "vtb": "vtb",
+  "втб": "vtb",
+  "gaz": "gaz",
+  "gazprom": "gaz",
+  "газ": "gaz",
+  "газпром": "gaz",
+}
+
+OPERATOR_QUERY_ALIASES = {
+  "mts": ["mts"],
+  "mts_premium": ["mts_premium", "mtspremium", "mts_salon", "mtssalon", "mts salon", "мтс салон"],
+  "bil": ["bil", "beeline", "билайн"],
+  "mega": ["mega", "megafon", "megafone", "мегафон"],
+  "t2": ["t2", "tele2", "tele_2", "теле2", "tele2salon", "tele2_salon", "tele2 salon", "tele2slaon"],
+  "vtb": ["vtb", "втб"],
+  "gaz": ["gaz", "gazprom", "газ", "газпром"],
+}
+
+
+def normalize_operator_key(raw: str) -> str:
+  v = str(raw or "").strip()
+  if not v:
+    return ""
+  low = v.lower()
+  return OPERATOR_KEY_ALIASES.get(low, low)
+
+
+def operator_key_variants(raw: str) -> list[str]:
+  key = normalize_operator_key(raw)
+  variants = OPERATOR_QUERY_ALIASES.get(key)
+  if variants:
+    return list(dict.fromkeys([key, *variants]))
+  return [key] if key else []
+
+
+def sql_in_clause(column: str, values: list[str]) -> tuple[str, list[str]]:
+  vals = [str(v) for v in values if str(v)]
+  if not vals:
+    return "1=0", []
+  return f"{column} IN ({','.join(['?'] * len(vals))})", vals
+
 # =========================================================
 
 START_BANNER = "start_banner.jpg"
@@ -703,6 +771,7 @@ class Database:
     return self.conn.execute("SELECT * FROM roles ORDER BY CASE role WHEN 'chief_admin' THEN 0 WHEN 'admin' THEN 1 WHEN 'operator' THEN 2 ELSE 3 END, user_id ASC").fetchall()
 
   def get_operator_price(self, operator_key: str) -> float:
+    operator_key = normalize_operator_key(operator_key)
     return float(self.get_setting(f"price_{operator_key}", str(OPERATORS[operator_key]["price"])))
 
   def create_queue_item(self, user_id: int, username: str, full_name: str, operator_key: str, normalized_phone: str, qr_file_id: str, mode: str):
@@ -718,11 +787,11 @@ class Database:
         user_id,
         username,
         full_name,
-        operator_key,
+        normalize_operator_key(operator_key),
         pretty_phone(normalized_phone),
         normalized_phone,
         qr_file_id,
-        get_mode_price(operator_key, mode, user_id),
+        get_mode_price(normalize_operator_key(operator_key), mode, user_id),
         now_str(),
         mode,
       ),
@@ -735,16 +804,20 @@ class Database:
     return QueueItem.from_row(row)
 
   def get_next_queue_item(self, operator_key: str):
+    values = operator_key_variants(operator_key)
+    clause, params = sql_in_clause("operator_key", values)
     row = self.conn.execute(
-      "SELECT * FROM queue_items WHERE operator_key = ? AND status = 'queued' ORDER BY " + queue_order_sql() + " LIMIT 1",
-      (operator_key,),
+      f"SELECT * FROM queue_items WHERE {clause} AND status = 'queued' ORDER BY " + queue_order_sql() + " LIMIT 1",
+      params,
     ).fetchone()
     return QueueItem.from_row(row)
 
   def count_waiting(self, operator_key: str) -> int:
+    values = operator_key_variants(operator_key)
+    clause, params = sql_in_clause("operator_key", values)
     row = self.conn.execute(
-      "SELECT COUNT(*) AS c FROM queue_items WHERE operator_key=? AND status='queued'",
-      (operator_key,),
+      f"SELECT COUNT(*) AS c FROM queue_items WHERE {clause} AND status='queued'",
+      params,
     ).fetchone()
     return int(row["c"] or 0)
 
@@ -1786,8 +1859,9 @@ def queue_page_items(page: int = 0, per_page: int = 10, operator_key: str = "all
   params = []
   where = "WHERE status='queued'"
   if operator_key != "all":
-    where += " AND operator_key=?"
-    params.append(operator_key)
+    clause, extra = sql_in_clause("operator_key", operator_key_variants(operator_key))
+    where += " AND " + clause
+    params.extend(extra)
   if mode_filter in {"hold", "no_hold"}:
     where += " AND mode=?"
     params.append(mode_filter)
@@ -2345,36 +2419,7 @@ async def miniapp_numbers(request):
 
 
 def miniapp_operator_key(raw: str) -> str:
-  v = (raw or '').strip().lower()
-  aliases = {
-    'mts': 'mts',
-    'мтс': 'mts',
-    'mts_premium': 'mts_premium',
-    'mtspremium': 'mts_premium',
-    'mts premium': 'mts_premium',
-    'mts salon': 'mts_premium',
-    'мтс салон': 'mts_premium',
-    'bil': 'bil',
-    'beeline': 'bil',
-    'билайн': 'bil',
-    'bee': 'bil',
-    'mega': 'mega',
-    'megafon': 'mega',
-    'megafone': 'mega',
-    'мегафон': 'mega',
-    't2': 't2',
-    'tele2': 't2',
-    'теле2': 't2',
-    'vtb': 'vtb',
-    'втб': 'vtb',
-    'gaz': 'gaz',
-    'gazprom': 'gaz',
-    'gazprombank': 'gaz',
-    'газ': 'gaz',
-    'газпром': 'gaz',
-    'газпромбанк': 'gaz',
-  }
-  return aliases.get(v, v)
+  return normalize_operator_key(raw)
 
 async def api_submit_meta(request):
   operator_key = miniapp_operator_key(request.query.get('operator_key') or '')
@@ -3497,8 +3542,8 @@ def create_queue_item_ext(user_id: int, username: str, full_name: str, operator_
     'qr_file_id', 'status', 'price', 'created_at', 'mode', 'submit_bot_token'
   ]
   values = [
-    user_id, username, full_name, operator_key, pretty_phone(normalized_phone), normalized_phone,
-    qr_file_id, 'queued', get_mode_price(operator_key, mode, user_id), now_str(), mode, submit_bot_token or BOT_TOKEN
+    user_id, username, full_name, normalize_operator_key(operator_key), pretty_phone(normalized_phone), normalized_phone,
+    qr_file_id, 'queued', get_mode_price(normalize_operator_key(operator_key), mode, user_id), now_str(), mode, submit_bot_token or BOT_TOKEN
   ]
   if 'qr_local_path' in qi_cols:
     insert_cols.insert(7, 'qr_local_path')
@@ -3521,17 +3566,22 @@ def get_mode_price(operator_key: str, mode: str, user_id: int | None = None) -> 
     custom = db.get_user_price(user_id, operator_key, mode)
     if custom is not None:
       return float(custom)
+  operator_key = normalize_operator_key(operator_key)
   legacy = db.get_setting(f"price_{operator_key}", str(OPERATORS[operator_key]['price']))
   return float(db.get_setting(f"price_{mode}_{operator_key}", legacy))
 
 
 def count_waiting_mode(operator_key: str, mode: str) -> int:
-  row = db.conn.execute("SELECT COUNT(*) AS c FROM queue_items WHERE operator_key=? AND mode=? AND status='queued'", (operator_key, mode)).fetchone()
+  values = operator_key_variants(operator_key)
+  clause, params = sql_in_clause("operator_key", values)
+  row = db.conn.execute(f"SELECT COUNT(*) AS c FROM queue_items WHERE {clause} AND mode=? AND status='queued'", [*params, mode]).fetchone()
   return int((row['c'] if row else 0) or 0)
 
 
 def get_next_queue_item_mode(operator_key: str, mode: str):
-  row = db.conn.execute("SELECT * FROM queue_items WHERE operator_key=? AND mode=? AND status='queued' ORDER BY " + queue_order_sql() + " LIMIT 1", (operator_key, mode)).fetchone()
+  values = operator_key_variants(operator_key)
+  clause, params = sql_in_clause("operator_key", values)
+  row = db.conn.execute(f"SELECT * FROM queue_items WHERE {clause} AND mode=? AND status='queued' ORDER BY " + queue_order_sql() + " LIMIT 1", [*params, mode]).fetchone()
   return QueueItem.from_row(row)
 
 
@@ -3547,9 +3597,11 @@ def set_numbers_enabled(flag: bool):
   db.set_setting('numbers_enabled', '1' if flag else '0')
 
 def is_operator_mode_enabled(operator_key: str, mode: str) -> bool:
+  operator_key = normalize_operator_key(operator_key)
   return db.get_setting(f"allow_{mode}_{operator_key}", "1") == "1"
 
 def set_operator_mode_enabled(operator_key: str, mode: str, flag: bool):
+  operator_key = normalize_operator_key(operator_key)
   db.set_setting(f"allow_{mode}_{operator_key}", "1" if flag else "0")
 
 
@@ -3794,6 +3846,7 @@ def cache_queue_photo_bytes(item, raw: bytes, ext: str = '.jpg') -> str | None:
     return None
 
 def group_price_for_take(chat_id: int, thread_id: int | None, operator_key: str, mode: str) -> float:
+  operator_key = normalize_operator_key(operator_key)
   price = db.get_group_price(chat_id, thread_id, operator_key, mode)
   if price is not None:
     return float(price)
@@ -3995,20 +4048,24 @@ CUSTOM_OPERATOR_EMOJI = {
 }
 
 def op_emoji_html(operator_key: str) -> str:
+  operator_key = normalize_operator_key(operator_key)
   emoji_id, fallback = CUSTOM_OPERATOR_EMOJI.get(operator_key, ("", "📱"))
   if emoji_id:
     return f'<tg-emoji emoji-id="{emoji_id}">{fallback}</tg-emoji>'
   return fallback
 
 def op_html(operator_key: str) -> str:
+  operator_key = normalize_operator_key(operator_key)
   return f"{op_emoji_html(operator_key)} <b>{escape(OPERATORS[operator_key]['title'])}</b>"
 
 def op_text(operator_key: str) -> str:
+  operator_key = normalize_operator_key(operator_key)
   fallback = CUSTOM_OPERATOR_EMOJI.get(operator_key, ("", "📱"))[1]
   return f"{fallback} {OPERATORS[operator_key]['title']}"
 
 
 def op_button_label(operator_key: str, *, with_fallback: bool = True) -> str:
+  operator_key = normalize_operator_key(operator_key)
   title = OPERATORS[operator_key]['title']
   if not with_fallback:
     return title
@@ -4017,6 +4074,7 @@ def op_button_label(operator_key: str, *, with_fallback: bool = True) -> str:
 
 
 def make_operator_button(operator_key: str, *, callback_data: str, prefix_mark: str = "", suffix_text: str = "") -> InlineKeyboardButton:
+  operator_key = normalize_operator_key(operator_key)
   emoji_id, fallback = CUSTOM_OPERATOR_EMOJI.get(operator_key, ("", "📱"))
   label = f"{prefix_mark}{op_button_label(operator_key, with_fallback=not bool(emoji_id))}{suffix_text}"
   payload = {"text": label, "callback_data": callback_data}
@@ -4655,7 +4713,7 @@ def esim_kb():
 async def takeop_callback(callback: CallbackQuery):
   if not is_operator_or_admin(callback.from_user.id):
     return
-  operator_key = callback.data.split(":", 1)[1]
+  operator_key = normalize_operator_key(callback.data.split(":", 1)[1])
   if operator_key not in OPERATORS:
     await callback.answer("Неизвестный оператор", show_alert=True)
     return
@@ -5269,6 +5327,7 @@ async def admin_toggle_avail(callback: CallbackQuery):
   if not is_admin(callback.from_user.id):
     return
   _, _, mode, operator_key = callback.data.split(":")
+  operator_key = normalize_operator_key(operator_key)
   set_operator_mode_enabled(operator_key, mode, not is_operator_mode_enabled(operator_key, mode))
   await safe_edit_or_send(callback, render_operator_modes(), reply_markup=operator_modes_kb())
   await callback.answer("Статус обновлён")
@@ -5510,6 +5569,7 @@ async def admin_set_price_start(callback: CallbackQuery, state: FSMContext):
   else:
     await callback.answer("Некорректные данные прайса", show_alert=True)
     return
+  operator_key = normalize_operator_key(operator_key)
   if operator_key not in OPERATORS or price_mode not in {"hold", "no_hold"}:
     await callback.answer("Некорректные данные прайса", show_alert=True)
     return
@@ -5791,6 +5851,7 @@ async def admin_operator_price_value(message: Message, state: FSMContext):
   data = await state.get_data()
   operator_key = data.get("operator_key")
   price_mode = data.get("price_mode", "hold")
+  operator_key = normalize_operator_key(operator_key)
   if operator_key not in OPERATORS or price_mode not in {"hold", "no_hold"}:
     await state.clear()
     await message.answer("Ошибка данных прайса. Откройте раздел прайсов заново.")
@@ -5994,7 +6055,7 @@ async def send_next_item_for_operator(message: Message, operator_key: str):
     raise
 
 
-@router.message(Command("mts", "mtc", "mtspremium", "mtssalon", "bil", "mega", "t2"))
+@router.message(Command("mts", "mtc", "mtspremium", "mtssalon", "bil", "mega", "t2", "tele2", "tele2salon"))
 async def legacy_take_commands(message: Message):
   if not is_operator_or_admin(message.from_user.id):
     return
@@ -6186,7 +6247,7 @@ def esim_kb():
 async def takeop_callback(callback: CallbackQuery):
   if not is_operator_or_admin(callback.from_user.id):
     return
-  operator_key = callback.data.split(":", 1)[1]
+  operator_key = normalize_operator_key(callback.data.split(":", 1)[1])
   if operator_key not in OPERATORS:
     await callback.answer("Неизвестный оператор", show_alert=True)
     return
@@ -6765,6 +6826,7 @@ async def admin_toggle_avail(callback: CallbackQuery):
   if not is_admin(callback.from_user.id):
     return
   _, _, mode, operator_key = callback.data.split(":")
+  operator_key = normalize_operator_key(operator_key)
   set_operator_mode_enabled(operator_key, mode, not is_operator_mode_enabled(operator_key, mode))
   await safe_edit_or_send(callback, render_operator_modes(), reply_markup=operator_modes_kb())
   await callback.answer("Статус обновлён")
@@ -6966,6 +7028,7 @@ async def admin_set_price_start(callback: CallbackQuery, state: FSMContext):
   else:
     await callback.answer("Некорректные данные прайса", show_alert=True)
     return
+  operator_key = normalize_operator_key(operator_key)
   if operator_key not in OPERATORS or price_mode not in {"hold", "no_hold"}:
     await callback.answer("Некорректные данные прайса", show_alert=True)
     return
@@ -7249,6 +7312,7 @@ async def admin_operator_price_value(message: Message, state: FSMContext):
   data = await state.get_data()
   operator_key = data.get("operator_key")
   price_mode = data.get("price_mode", "hold")
+  operator_key = normalize_operator_key(operator_key)
   if operator_key not in OPERATORS or price_mode not in {"hold", "no_hold"}:
     await state.clear()
     await message.answer("Ошибка данных прайса. Откройте раздел прайсов заново.")
@@ -7452,7 +7516,7 @@ async def send_next_item_for_operator(message: Message, operator_key: str):
     raise
 
 
-@router.message(Command("mts", "mtc", "mtspremium", "mtssalon", "bil", "mega", "t2"))
+@router.message(Command("mts", "mtc", "mtspremium", "mtssalon", "bil", "mega", "t2", "tele2", "tele2salon"))
 async def legacy_take_commands(message: Message):
   if not is_operator_or_admin(message.from_user.id):
     return
@@ -7789,8 +7853,9 @@ def recent_qr_items(limit: int = 50, operator_key: str = "all", status_filter: s
   params = []
   clauses = []
   if operator_key != "all":
-    clauses.append("operator_key=?")
-    params.append(operator_key)
+    clause, extra = sql_in_clause("operator_key", operator_key_variants(operator_key))
+    clauses.append(clause)
+    params.extend(extra)
   if status_filter == "queued":
     clauses.append("status='queued'")
   if mode_filter in {"hold", "no_hold"}:
@@ -7808,8 +7873,9 @@ def qr_page_items(page: int = 0, per_page: int = 1, operator_key: str = "all", s
   params = []
   clauses = []
   if operator_key != "all":
-    clauses.append("operator_key=?")
-    params.append(operator_key)
+    clause, extra = sql_in_clause("operator_key", operator_key_variants(operator_key))
+    clauses.append(clause)
+    params.extend(extra)
   if status_filter == "queued":
     clauses.append("status='queued'")
   if mode_filter in {"hold", "no_hold"}:
