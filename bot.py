@@ -1810,7 +1810,7 @@ def queue_manage_kb(page: int = 0, operator_key: str = "all", day_filter: str = 
   admin_scope_filter_buttons(kb, "admin:queue_filter", operator_key, "queued", day_filter, mode_filter)
   admin_mode_filter_buttons(kb, "admin:queue_filter", operator_key, "queued", day_filter, mode_filter)
   for item in items:
-    short_op = op_text(item['operator_key']).replace('🟡 ', '').replace('⚫ ', '').replace('🟢 ', '').replace('🔴 ', '').replace('🔵 ', '').replace('⚪ ', '')
+    short_op = op_text(queue_item_value(item, 'operator_key')).replace('🟡 ', '').replace('⚫ ', '').replace('🟢 ', '').replace('🔴 ', '').replace('🔵 ', '').replace('⚪ ', '')
     label = f"#{queue_item_value(item, 'id')} • {short_op} • {pretty_phone(queue_item_value(item, 'normalized_phone'))}"
     kb.button(text=f"👁 {label}"[:64], callback_data=f"admin:queue_view:{queue_item_value(item, 'id')}:{page}:{operator_key}:{day_filter}:{mode_filter}")
     kb.button(text=f"🗑 {label}"[:64], callback_data=f"admin:queue_remove:{queue_item_value(item, 'id')}:{page}:{operator_key}:{day_filter}:{mode_filter}")
@@ -4667,7 +4667,7 @@ async def takeop_callback(callback: CallbackQuery):
     await callback.answer("Очередь пуста", show_alert=True)
     return
   # item may already be taken by mode helper; otherwise take it now
-  if item['status'] == 'queued':
+  if queue_item_value(item, 'status') == 'queued':
     if not db.take_queue_item(queue_item_value(item, 'id'), callback.from_user.id):
       await callback.answer("Заявку уже забрали", show_alert=True)
       return
@@ -6198,7 +6198,7 @@ async def takeop_callback(callback: CallbackQuery):
     await callback.answer("Очередь пуста", show_alert=True)
     return
   # item may already be taken by mode helper; otherwise take it now
-  if item['status'] == 'queued':
+  if queue_item_value(item, 'status') == 'queued':
     if not db.take_queue_item(queue_item_value(item, 'id'), callback.from_user.id):
       await callback.answer("Заявку уже забрали", show_alert=True)
       return
@@ -7847,18 +7847,18 @@ def admin_qr_browser_kb(index: int, total: int, operator_key: str = "all", statu
 
 
 def render_qr_browser_caption(item) -> str:
-  username = item['username'] or 'без username'
+  username = queue_item_value(item, 'username') or 'без username'
   if username and username != 'без username' and not str(username).startswith('@'):
     username = '@' + str(username)
-  name = item['full_name'] or 'Без имени'
-  phone = pretty_phone(item['normalized_phone'])
-  operator = op_text(item['operator_key'])
-  mode = mode_label(item['mode'])
+  name = queue_item_value(item, 'full_name') or 'Без имени'
+  phone = pretty_phone(queue_item_value(item, 'normalized_phone'))
+  operator = op_text(queue_item_value(item, 'operator_key'))
+  mode = mode_label(queue_item_value(item, 'mode'))
   status = status_label_from_row(item)
-  created = item['created_at']
+  created = str(queue_item_value(item, 'created_at', ''))
   user_line = (
     f"<b>👤 Человек:</b> {escape(name)}\n"
-    f"<b>🆔 ID:</b> <code>{item['user_id']}</code>\n"
+    f"<b>🆔 ID:</b> <code>{queue_item_value(item, 'user_id', '')}</code>\n"
     f"<b>🔗 Username:</b> {escape(username)}"
   )
   return (
@@ -7925,9 +7925,10 @@ def render_admin_queue_text(page: int = 0, operator_key: str = "all", day_filter
     return title + "\n\n<i>Заявок в очереди по выбранным фильтрам нет.</i>"
   rows = []
   for item in items:
-    pos = queue_position(queue_item_value(item, 'id')) if item['status'] == 'queued' else None
+    status_value = queue_item_value(item, 'status')
+    pos = queue_position(queue_item_value(item, 'id')) if status_value == 'queued' else None
     pos_text = f" • позиция {pos}" if pos else ""
-    rows.append(f"#{queue_item_value(item, 'id')} • {op_text(item['operator_key'])} • {mode_label(item['mode'])} • {pretty_phone(queue_item_value(item, 'normalized_phone'))}{pos_text}")
+    rows.append(f"#{queue_item_value(item, 'id')} • {op_text(queue_item_value(item, 'operator_key'))} • {mode_label(queue_item_value(item, 'mode'))} • {pretty_phone(queue_item_value(item, 'normalized_phone'))}{pos_text}")
   header = f"<b>📦 Очередь</b>\n<b>Страница:</b> {safe_page + 1}/{total_pages}\n<b>Статус:</b> queued"
   if filters:
     header += f"\n<b>Фильтры:</b> {' • '.join(filters)}"
@@ -8407,8 +8408,9 @@ async def admin_queue_remove(callback: CallbackQuery):
     page = 0
   operator_key = parts[4] if len(parts) > 4 else "all"
   day_filter = parts[5] if len(parts) > 5 else "all"
+  mode_filter = parts[6] if len(parts) > 6 else "all"
   remove_queue_item(item_id, reason='admin_removed', admin_id=callback.from_user.id)
-  await safe_edit_or_send(callback, render_admin_queue_text(page, operator_key, day_filter), reply_markup=queue_manage_kb(page, operator_key, day_filter))
+  await safe_edit_or_send(callback, render_admin_queue_text(page, operator_key, day_filter, mode_filter), reply_markup=queue_manage_kb(page, operator_key, day_filter, mode_filter))
   await callback.answer("Удалено из очереди")
 
 @router.callback_query(F.data.startswith("myremove:"))
