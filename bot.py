@@ -389,6 +389,12 @@ class Database:
       except Exception:
         logging.exception('restore preserved workspaces failed after db replace')
     try:
+      self.conn.execute("UPDATE queue_items SET mode='hold' WHERE lower(COALESCE(mode,'')) IN ('with_hold','withhold','on_hold','holded','1','true','yes','холд')")
+      self.conn.execute("UPDATE queue_items SET mode='no_hold' WHERE lower(COALESCE(mode,'')) IN ('nohold','without_hold','without-hold','no-hold','0','false','безхолд','без_холд','без холда')")
+      self.conn.commit()
+    except Exception:
+      logging.exception('normalize queue item modes failed after db replace')
+    try:
       reload_operators_from_db()
     except Exception:
       logging.exception("reload_operators_from_db failed after db replace")
@@ -775,6 +781,7 @@ class Database:
     return float(self.get_setting(f"price_{operator_key}", str(OPERATORS[operator_key]["price"])))
 
   def create_queue_item(self, user_id: int, username: str, full_name: str, operator_key: str, normalized_phone: str, qr_file_id: str, mode: str):
+    mode = normalize_mode(mode)
     cur = self.conn.cursor()
     cur.execute(
       """
@@ -3335,9 +3342,26 @@ def render_workspaces() -> str:
 
 
 
+def normalize_mode(mode: str | None) -> str:
+  value = str(mode or '').strip().lower()
+  if value in {'hold', 'with_hold', 'withhold', 'on_hold', 'holded', '1', 'true', 'yes', 'холд'}:
+    return 'hold'
+  if value in {'no_hold', 'nohold', 'without_hold', 'without-hold', 'no-hold', '0', 'false', 'безхолд', 'без_холд', 'без холда'}:
+    return 'no_hold'
+  return value or 'no_hold'
+
+
+def mode_variants(mode: str | None) -> list[str]:
+  normalized = normalize_mode(mode)
+  if normalized == 'hold':
+    return ['hold', 'with_hold', 'withhold', 'on_hold', 'holded', '1', 'true', 'yes', 'Холд', 'холд']
+  if normalized == 'no_hold':
+    return ['no_hold', 'nohold', 'without_hold', 'without-hold', 'no-hold', '0', 'false', 'БезХолд', 'безхолд', 'без холда']
+  return [normalized]
+
 
 def mode_label(mode: str) -> str:
-  return "Холд" if mode == "hold" else "Без холда"
+  return "Холд" if normalize_mode(mode) == "hold" else "Без холда"
 
 
 def mode_emoji(mode: str) -> str:
@@ -3573,15 +3597,17 @@ def get_mode_price(operator_key: str, mode: str, user_id: int | None = None) -> 
 
 def count_waiting_mode(operator_key: str, mode: str) -> int:
   values = operator_key_variants(operator_key)
-  clause, params = sql_in_clause("operator_key", values)
-  row = db.conn.execute(f"SELECT COUNT(*) AS c FROM queue_items WHERE {clause} AND mode=? AND status='queued'", [*params, mode]).fetchone()
+  clause_op, params_op = sql_in_clause("operator_key", values)
+  clause_mode, params_mode = sql_in_clause("mode", mode_variants(mode))
+  row = db.conn.execute(f"SELECT COUNT(*) AS c FROM queue_items WHERE {clause_op} AND {clause_mode} AND status='queued'", [*params_op, *params_mode]).fetchone()
   return int((row['c'] if row else 0) or 0)
 
 
 def get_next_queue_item_mode(operator_key: str, mode: str):
   values = operator_key_variants(operator_key)
-  clause, params = sql_in_clause("operator_key", values)
-  row = db.conn.execute(f"SELECT * FROM queue_items WHERE {clause} AND mode=? AND status='queued' ORDER BY " + queue_order_sql() + " LIMIT 1", [*params, mode]).fetchone()
+  clause_op, params_op = sql_in_clause("operator_key", values)
+  clause_mode, params_mode = sql_in_clause("mode", mode_variants(mode))
+  row = db.conn.execute(f"SELECT * FROM queue_items WHERE {clause_op} AND {clause_mode} AND status='queued' ORDER BY " + queue_order_sql() + " LIMIT 1", [*params_op, *params_mode]).fetchone()
   return QueueItem.from_row(row)
 
 
@@ -7677,6 +7703,7 @@ async def esim_take(callback: CallbackQuery):
   if not is_operator_or_admin(callback.from_user.id):
     return
   _, operator_key, mode = callback.data.split(':')
+  mode = normalize_mode(mode)
   thread_id = getattr(callback.message, 'message_thread_id', None)
   topic_allowed = db.is_workspace_enabled(callback.message.chat.id, thread_id, 'topic') if thread_id else False
   group_allowed = db.is_workspace_enabled(callback.message.chat.id, None, 'group')
