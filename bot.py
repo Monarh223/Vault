@@ -80,6 +80,7 @@ BASE_OPERATORS = {
   "t2": {"title": "Tele2", "price": 4.20, "command": "/t2"},
   "vtb": {"title": "ВТБ", "price": 4.80, "command": "/vtb"},
   "gaz": {"title": "Газпром", "price": 4.90, "command": "/gaz"},
+  "dobrosvyz": {"title": "Добросвязь", "price": 4.50, "command": "/dobrosvyz"},
 }
 
 OPERATORS = {k: dict(v) for k, v in BASE_OPERATORS.items()}
@@ -116,6 +117,9 @@ OPERATOR_KEY_ALIASES = {
   "gazprom": "gaz",
   "газ": "gaz",
   "газпром": "gaz",
+  "dobrosvyz": "dobrosvyz",
+  "dobrosvyaz": "dobrosvyz",
+  "добросвязь": "dobrosvyz",
 }
 
 OPERATOR_QUERY_ALIASES = {
@@ -126,6 +130,7 @@ OPERATOR_QUERY_ALIASES = {
   "t2": ["t2", "tele2", "tele_2", "теле2", "tele2salon", "tele2_salon", "tele2 salon", "tele2slaon"],
   "vtb": ["vtb", "втб"],
   "gaz": ["gaz", "gazprom", "газ", "газпром"],
+  "dobrosvyz": ["dobrosvyz", "dobrosvyaz", "добросвязь"],
 }
 
 
@@ -778,7 +783,8 @@ class Database:
 
   def get_operator_price(self, operator_key: str) -> float:
     operator_key = normalize_operator_key(operator_key)
-    return float(self.get_setting(f"price_{operator_key}", str(OPERATORS[operator_key]["price"])))
+    default_price = float(OPERATORS.get(operator_key, {}).get("price", 0) or 0)
+    return float(self.get_setting(f"price_{operator_key}", str(default_price)))
 
   def create_queue_item(self, user_id: int, username: str, full_name: str, operator_key: str, normalized_phone: str, qr_file_id: str, mode: str):
     mode = normalize_mode(mode)
@@ -3591,7 +3597,7 @@ def get_mode_price(operator_key: str, mode: str, user_id: int | None = None) -> 
     if custom is not None:
       return float(custom)
   operator_key = normalize_operator_key(operator_key)
-  legacy = db.get_setting(f"price_{operator_key}", str(OPERATORS[operator_key]['price']))
+  legacy = db.get_setting(f"price_{operator_key}", str(OPERATORS.get(operator_key, {}).get('price', 0)))
   return float(db.get_setting(f"price_{mode}_{operator_key}", legacy))
 
 
@@ -4082,17 +4088,20 @@ def op_emoji_html(operator_key: str) -> str:
 
 def op_html(operator_key: str) -> str:
   operator_key = normalize_operator_key(operator_key)
-  return f"{op_emoji_html(operator_key)} <b>{escape(OPERATORS[operator_key]['title'])}</b>"
+  op = OPERATORS.get(operator_key, {})
+  title = escape(op.get('title', operator_key))
+  return f"{op_emoji_html(operator_key)} <b>{title}</b>"
 
 def op_text(operator_key: str) -> str:
   operator_key = normalize_operator_key(operator_key)
   fallback = CUSTOM_OPERATOR_EMOJI.get(operator_key, ("", "📱"))[1]
-  return f"{fallback} {OPERATORS[operator_key]['title']}"
+  title = OPERATORS.get(operator_key, {}).get('title', operator_key)
+  return f"{fallback} {title}"
 
 
 def op_button_label(operator_key: str, *, with_fallback: bool = True) -> str:
   operator_key = normalize_operator_key(operator_key)
-  title = OPERATORS[operator_key]['title']
+  title = OPERATORS.get(operator_key, {}).get('title', operator_key)
   if not with_fallback:
     return title
   fallback = (CUSTOM_OPERATOR_EMOJI.get(operator_key, ("", "📱"))[1] or "📱").strip()
